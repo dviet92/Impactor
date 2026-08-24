@@ -126,6 +126,7 @@ pub async fn execute(args: SignArgs) -> Result<()> {
 
                 Some(Device {
                     name: "My Mac".to_string(),
+                    os_version: None,
                     udid: String::new(),
                     device_id: 0,
                     usbmuxd_device: None,

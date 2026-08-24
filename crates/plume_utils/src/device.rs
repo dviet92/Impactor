@@ -8,7 +8,7 @@ use idevice::misagent::MisagentClient;
 use idevice::provider::UsbmuxdProvider;
 use idevice::remote_pairing::{RemotePairingClient, RpPairingFile};
 use idevice::rsd::RsdHandshake;
-use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdDevice};
+use idevice::usbmuxd::{UsbmuxdAddr, UsbmuxdDevice};
 use idevice::utils::installation;
 use idevice::{IdeviceService, RemoteXpcClient};
 use plume_core::MobileProvision;
@@ -38,6 +38,8 @@ macro_rules! get_dict_string {
 #[derive(Debug, Clone)]
 pub struct Device {
     pub name: String,
+    /// iOS/iPadOS version reported by lockdown (`ProductVersion`), when known.
+    pub os_version: Option<String>,
     pub udid: String,
     pub device_id: u32,
     pub usbmuxd_device: Option<UsbmuxdDevice>,
@@ -48,12 +50,13 @@ pub struct Device {
 
 impl Device {
     pub async fn new(usbmuxd_device: UsbmuxdDevice) -> Self {
-        let name = Self::get_name_from_usbmuxd_device(&usbmuxd_device)
+        let (name, os_version) = Self::get_info_from_usbmuxd_device(&usbmuxd_device)
             .await
             .unwrap_or_default();
 
         Device {
             name,
+            os_version,
             udid: usbmuxd_device.udid.clone(),
             device_id: usbmuxd_device.device_id.clone(),
             usbmuxd_device: Some(usbmuxd_device),
@@ -61,12 +64,19 @@ impl Device {
         }
     }
 
-    async fn get_name_from_usbmuxd_device(device: &UsbmuxdDevice) -> Result<String, Error> {
+    /// Reads the display name and OS version in a single lockdown round trip.
+    async fn get_info_from_usbmuxd_device(
+        device: &UsbmuxdDevice,
+    ) -> Result<(String, Option<String>), Error> {
         let mut lockdown =
             LockdownClient::connect(&device.to_provider(UsbmuxdAddr::default(), CONNECTION_LABEL))
                 .await?;
         let values = lockdown.get_value(None, None).await?;
-        Ok(get_dict_string!(values, "DeviceName"))
+
+        let name = get_dict_string!(values, "DeviceName");
+        let os_version = get_dict_string!(values, "ProductVersion");
+
+        Ok((name, (!os_version.is_empty()).then_some(os_version)))
     }
 
     pub async fn installed_apps(&self) -> Result<Vec<SignerAppReal>, Error> {
@@ -371,20 +381,28 @@ fn get_app_name_from_info(info: &Value) -> Option<String> {
 }
 
 impl fmt::Display for Device {
+    /// Renders as `name (version) udid`, e.g. `iPhone (18.5) 00008110-000A1B2C3D4E801E`.
+    ///
+    /// Parts we do not know are dropped rather than shown empty, so a device whose
+    /// lockdown query failed still gets a usable label.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}] {}",
-            match &self.usbmuxd_device {
-                Some(device) => match &device.connection_type {
-                    Connection::Usb => "USB",
-                    Connection::Network(_) => "WiFi",
-                    Connection::Unknown(_) => "Unknown",
-                },
-                None => "LOCAL",
-            },
-            self.name
-        )
+        let name = if self.name.is_empty() {
+            "Unknown Device"
+        } else {
+            self.name.as_str()
+        };
+
+        write!(f, "{name}")?;
+
+        if let Some(os_version) = &self.os_version {
+            write!(f, " ({os_version})")?;
+        }
+
+        if !self.udid.is_empty() {
+            write!(f, " {}", self.udid)?;
+        }
+
+        Ok(())
     }
 }
 

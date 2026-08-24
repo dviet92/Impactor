@@ -163,6 +163,15 @@ impl Package {
     }
 
     pub fn get_package_bundle(&self) -> Result<Bundle, Error> {
+        // Start from a pristine extraction. Signing leaves behind files that are
+        // not in the archive at all -- `_CodeSignature`, `embedded.mobileprovision`,
+        // injected tweaks -- and extracting over them would carry the previous
+        // run's state into this one. That matters now that a package can be
+        // installed more than once without being reloaded.
+        if self.stage_payload_dir.exists() {
+            fs::remove_dir_all(&self.stage_payload_dir)?;
+        }
+
         let file = fs::File::open(&self.package_file)?;
         let mut archive = ZipArchive::new(file)?;
         archive.extract(&self.stage_dir)?;

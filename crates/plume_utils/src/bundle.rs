@@ -274,6 +274,7 @@ impl BundleType {
             "appex" => Some(BundleType::AppExtension),
             "framework" => Some(BundleType::Framework),
             "dylib" => Some(BundleType::Dylib),
+            "xctest" => Some(BundleType::Framework),
             _ => Some(BundleType::Unknown),
         }
     }

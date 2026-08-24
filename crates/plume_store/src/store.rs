@@ -14,6 +14,10 @@ pub struct AccountStore {
     #[serde(default)]
     refreshes: HashMap<String, RefreshDevice>, // UDID -> RefreshDevice (apps?)
     #[serde(default)]
+    device_accounts: HashMap<String, String>, // UDID -> email that last installed successfully
+    #[serde(default)]
+    auto_select_account: bool, // prefer `device_accounts` over `selected_account` when installing
+    #[serde(default)]
     locale: Option<String>, // None = system locale
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -99,19 +103,22 @@ impl AccountStore {
     }
 
     pub async fn accounts_remove(&mut self, email: &str) -> Result<(), Error> {
-        self.accounts.remove(email);
-        if self.selected_account.as_ref() == Some(&email.to_string()) {
-            self.selected_account = None;
-        }
+        self.forget_account(email);
         self.save().await
     }
 
     pub fn accounts_remove_sync(&mut self, email: &str) -> Result<(), Error> {
+        self.forget_account(email);
+        self.save_sync()
+    }
+
+    fn forget_account(&mut self, email: &str) {
         self.accounts.remove(email);
-        if self.selected_account.as_ref() == Some(&email.to_string()) {
+        if self.selected_account.as_deref() == Some(email) {
             self.selected_account = None;
         }
-        self.save_sync()
+        // Otherwise auto-select would keep pointing devices at an account that is gone.
+        self.device_accounts.retain(|_, stored| stored != email);
     }
 
     pub async fn account_select(&mut self, email: &str) -> Result<(), Error> {
@@ -223,5 +230,64 @@ impl AccountStore {
     pub fn remove_refresh_device_sync(&mut self, udid: &str) -> Result<(), Error> {
         self.refreshes.remove(udid);
         self.save_sync()
+    }
+
+    /// Whether installs should prefer the account remembered for the target device.
+    pub fn auto_select_account(&self) -> bool {
+        self.auto_select_account
+    }
+
+    pub fn set_auto_select_account_sync(&mut self, enabled: bool) -> Result<(), Error> {
+        self.auto_select_account = enabled;
+        self.save_sync()
+    }
+
+    /// Email of the account that last installed successfully onto `udid`.
+    pub fn device_account_email(&self, udid: &str) -> Option<&String> {
+        self.device_accounts.get(udid)
+    }
+
+    /// Records that `email` installed successfully onto `udid`.
+    ///
+    /// Writing the store is skipped when nothing changed, so the common case of
+    /// reinstalling with the same account does not touch the disk.
+    pub fn record_device_account_sync(&mut self, udid: &str, email: &str) -> Result<(), Error> {
+        if udid.is_empty() || !self.accounts.contains_key(email) {
+            return Ok(());
+        }
+
+        if self.device_accounts.get(udid).map(String::as_str) == Some(email) {
+            return Ok(());
+        }
+
+        self.device_accounts
+            .insert(udid.to_string(), email.to_string());
+        self.save_sync()
+    }
+
+    pub fn forget_device_account_sync(&mut self, udid: &str) -> Result<(), Error> {
+        if self.device_accounts.remove(udid).is_none() {
+            return Ok(());
+        }
+        self.save_sync()
+    }
+
+    /// The account an install targeting `udid` should use.
+    ///
+    /// With auto-select on, the account remembered for that device wins; anything
+    /// else (auto-select off, unknown device, or a remembered account that has since
+    /// been removed) falls back to the manually selected account.
+    pub fn account_for_device(&self, udid: Option<&str>) -> Option<&GsaAccount> {
+        if self.auto_select_account {
+            if let Some(account) = udid
+                .filter(|udid| !udid.is_empty())
+                .and_then(|udid| self.device_accounts.get(udid))
+                .and_then(|email| self.accounts.get(email))
+            {
+                return Some(account);
+            }
+        }
+
+        self.selected_account()
     }
 }

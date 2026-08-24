@@ -29,6 +29,7 @@ pub(crate) fn device_listener() -> Subscription<Message> {
                             if let Some(mac_udid) = plume_gestalt::get_udid() {
                                 let _ = tx.unbounded_send(Message::DeviceConnected(Device {
                                     name: "This Mac".into(),
+                                    os_version: None,
                                     udid: mac_udid,
                                     device_id: u32::MAX,
                                     usbmuxd_device: None,
@@ -438,6 +439,22 @@ pub(crate) async fn run_installation(
                                     &pairing_file_bundle_path,
                                 )
                                 .await;
+                        }
+                    }
+
+                    // The install went through, so remember which Apple ID provisioned
+                    // this device. That is what the auto-select option reads next time.
+                    // Ad-hoc installs have no account to remember.
+                    if options.mode == SignerMode::Pem {
+                        if let (Some(account), Some(store)) = (account, store.as_mut()) {
+                            if let Err(e) =
+                                store.record_device_account_sync(&dev.udid, account.email())
+                            {
+                                log::warn!(
+                                    "Failed to remember account for device {}: {e}",
+                                    dev.udid
+                                );
+                            }
                         }
                     }
                 } else {

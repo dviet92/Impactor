@@ -94,6 +94,10 @@ pub struct Impactor {
     pending_installation: bool,
     certificate_reset_queue: VecDeque<crate::certificate_reset::ConfirmationRequest>,
     selected_locale: Option<String>,
+    /// Installer screen kept alive while an install runs, so leaving the progress
+    /// screen returns to the loaded package instead of the empty drop zone.
+    parked_installer: Option<package::PackageScreen>,
+    install_in_flight: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +149,8 @@ impl Impactor {
                 pending_installation: false,
                 certificate_reset_queue: VecDeque::new(),
                 selected_locale,
+                parked_installer: None,
+                install_in_flight: false,
             },
             open_task,
         )
@@ -302,7 +308,14 @@ impl Impactor {
                     Task::none()
                 }
                 ImpactorScreen::Progress(_) => {
-                    self.navigate_to_screen(ImpactorScreenType::Main);
+                    // The package is still staged, so the user can pick another
+                    // device and install the same app again without reloading it.
+                    match self.parked_installer.take() {
+                        Some(installer) => {
+                            self.current_screen = ImpactorScreen::Installer(installer)
+                        }
+                        None => self.navigate_to_screen(ImpactorScreenType::Main),
+                    }
                     Task::none()
                 }
                 ImpactorScreen::Settings(_) => {
@@ -578,6 +591,14 @@ impl Impactor {
                             }
                             screen.update(msg).map(Message::SettingsScreen)
                         }
+                        settings::Message::ToggleAutoAccount(enabled) => {
+                            if let Some(store) = &mut self.account_store {
+                                if let Err(err) = store.set_auto_select_account_sync(enabled) {
+                                    log::error!("Failed to persist auto account setting: {err}");
+                                }
+                            }
+                            Task::none()
+                        }
                         settings::Message::SelectLocale(choice) => {
                             self.selected_locale = choice.clone();
                             let effective = choice
@@ -609,12 +630,7 @@ impl Impactor {
 
                             use plume_utils::SignerMode;
                             if matches!(screen.options.mode, SignerMode::Pem) {
-                                if self
-                                    .account_store
-                                    .as_ref()
-                                    .and_then(|s| s.selected_account())
-                                    .is_none()
-                                {
+                                if self.account_for_selected_device().is_none() {
                                     self.pending_installation = true;
 
                                     let (login_window, task) = login_window::LoginWindow::new();
@@ -638,9 +654,14 @@ impl Impactor {
                     match msg {
                         progress::Message::Back => Task::done(Message::PreviousScreen),
                         progress::Message::InstallationFinished => {
+                            self.install_in_flight = false;
                             Task::done(Message::UpdateTrayMenu)
                         }
-                        _ => screen.update(msg).map(Message::ProgressScreen),
+                        _ => {
+                            let task = screen.update(msg).map(Message::ProgressScreen);
+                            self.install_in_flight = screen.is_installing;
+                            task
+                        }
                     }
                 } else {
                     Task::none()
@@ -855,7 +876,11 @@ impl Impactor {
             ImpactorScreen::Main(screen) => screen.view().map(Message::MainScreen),
             ImpactorScreen::Utilities(screen) => screen.view().map(Message::UtilitiesScreen),
             ImpactorScreen::Settings(screen) => screen
-                .view(&self.account_store, &self.selected_locale)
+                .view(
+                    &self.account_store,
+                    &self.selected_locale,
+                    self.selected_device.as_ref(),
+                )
                 .map(Message::SettingsScreen),
             ImpactorScreen::Installer(screen) => {
                 screen.view(has_device).map(Message::InstallerScreen)
@@ -888,7 +913,9 @@ impl Impactor {
 
         container(
             row![
-                container(text("")).width(Fill),
+                // The label carries name, OS version and UDID now, which does not
+                // fit in the old 250px box parked on the right. Let the picker take
+                // the whole bar instead, so it lines up with the content below it.
                 pick_list(
                     device_names,
                     selected_device_name.clone(),
@@ -896,9 +923,10 @@ impl Impactor {
                 )
                 .style(appearance::s_pick_list)
                 .placeholder(placeholder_str)
-                .width(250),
+                .width(Fill),
                 right_button
             ]
+            .align_y(iced::Alignment::Center)
             .spacing(appearance::THEME_PADDING),
         )
         .width(Fill)
@@ -965,6 +993,19 @@ impl Impactor {
                     }
                 }
 
+                // Only safe once the worker thread is done with the staged copy;
+                // while an install is running we would rather leak a temp folder
+                // than delete the files being signed out from under it.
+                if !self.install_in_flight {
+                    if let Some(package) = self
+                        .parked_installer
+                        .take()
+                        .and_then(|installer| installer.selected_package)
+                    {
+                        package.remove_package_stage();
+                    }
+                }
+
                 self.current_screen = ImpactorScreen::Main(general::GeneralScreen::new());
             }
             ImpactorScreenType::Utilities => {
@@ -982,6 +1023,15 @@ impl Impactor {
         }
     }
 
+    /// The account an install would use right now: the one remembered for the
+    /// selected device when auto-select is on, otherwise the one ticked in Settings.
+    fn account_for_selected_device(&self) -> Option<&plume_store::GsaAccount> {
+        let udid = self.selected_device.as_ref().map(|d| d.udid.as_str());
+        self.account_store
+            .as_ref()
+            .and_then(|store| store.account_for_device(udid))
+    }
+
     fn start_installation_task(&mut self) -> Task<Message> {
         if let ImpactorScreen::Installer(installer) = &self.current_screen {
             let Some(package) = installer.selected_package.clone() else {
@@ -990,10 +1040,7 @@ impl Impactor {
 
             let device = self.selected_device.clone();
             let options = installer.options.clone();
-            let account = self
-                .account_store
-                .as_ref()
-                .and_then(|s| s.selected_account().cloned());
+            let account = self.account_for_selected_device().cloned();
             let mut store = self.account_store.clone();
 
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1001,7 +1048,14 @@ impl Impactor {
 
             let mut progress_screen = progress::ProgressScreen::new();
             progress_screen.start_installation(progress_rx.clone());
-            self.current_screen = ImpactorScreen::Progress(progress_screen);
+
+            if let ImpactorScreen::Installer(installer) = std::mem::replace(
+                &mut self.current_screen,
+                ImpactorScreen::Progress(progress_screen),
+            ) {
+                self.parked_installer = Some(installer);
+            }
+            self.install_in_flight = true;
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -1017,19 +1071,14 @@ impl Impactor {
                     )
                     .await
                     {
+                        // The staged copy is deliberately left in place. It is what
+                        // lets the user go back and install the same package to another
+                        // device, and it is cleaned up when they return to the drop zone.
                         Ok(_) => {
                             let _ = tx.send(("Installation complete!".to_string(), 100));
-
-                            if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
-                                package.remove_package_stage();
-                            }
                         }
                         Err(e) => {
                             let _ = tx_error.send((format!("Error: {}", e), -1));
-
-                            if std::env::var("PLUME_DELETE_AFTER_FINISHED").is_err() {
-                                package.remove_package_stage();
-                            }
                         }
                     }
                 });

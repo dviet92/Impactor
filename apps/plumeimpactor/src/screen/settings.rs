@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text};
 use iced::{Alignment, Element, Fill, Task};
 use plume_store::AccountStore;
+use plume_utils::Device;
 use rust_i18n::t;
 
 use crate::appearance;
@@ -29,6 +30,7 @@ pub enum Message {
     FetchTeams(String),
     TeamsLoaded(String, Vec<Team>),
     ToggleAutoStart(bool),
+    ToggleAutoAccount(bool),
     SelectLocale(Option<String>),
 }
 
@@ -89,6 +91,7 @@ impl SettingsScreen {
                 Task::none()
             }
             Message::ToggleAutoStart(_) => Task::none(),
+            Message::ToggleAutoAccount(_) => Task::none(),
             Message::SelectTeam(_, _) => Task::none(),
             Message::SelectLocale(_) => Task::none(),
             _ => Task::none(),
@@ -99,6 +102,7 @@ impl SettingsScreen {
         &'a self,
         account_store: &'a Option<AccountStore>,
         selected_locale: &'a Option<String>,
+        selected_device: Option<&'a Device>,
     ) -> Element<'a, Message> {
         let Some(store) = account_store else {
             return column![text(t!("settings_loading_accounts"))]
@@ -115,6 +119,8 @@ impl SettingsScreen {
             .and_then(|acc| accounts.iter().position(|(e, _)| *e == acc.email()));
 
         let mut content = column![].spacing(appearance::THEME_PADDING);
+
+        content = content.push(self.view_auto_account_toggle(store, selected_device));
 
         if !accounts.is_empty() {
             let account_list = accounts.iter().enumerate().fold(
@@ -196,6 +202,46 @@ impl SettingsScreen {
         content = content.push(self.view_auto_start_toggle(auto_start_enabled));
         content = content.push(self.view_language_picker(selected_locale));
         content = content.push(self.view_account_buttons(selected_index));
+
+        content.into()
+    }
+
+    /// Toggle for "pick the Apple ID by device", plus a line showing what it
+    /// currently resolves to for the device selected in the top bar.
+    fn view_auto_account_toggle<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        selected_device: Option<&'a Device>,
+    ) -> Element<'a, Message> {
+        let enabled = store.auto_select_account();
+
+        let mut content = column![
+            checkbox(enabled)
+                .label(t!("settings_auto_account"))
+                .on_toggle(Message::ToggleAutoAccount)
+        ]
+        .spacing(appearance::THEME_PADDING);
+
+        if enabled {
+            let hint = match selected_device.filter(|device| !device.udid.is_empty()) {
+                Some(device) => match store
+                    .device_account_email(&device.udid)
+                    .filter(|email| store.get_account(email).is_some())
+                {
+                    Some(email) => t!(
+                        "settings_auto_account_known",
+                        device = device.name.as_str(),
+                        account = email.as_str()
+                    )
+                    .to_string(),
+                    None => t!("settings_auto_account_unknown", device = device.name.as_str())
+                        .to_string(),
+                },
+                None => t!("settings_auto_account_no_device").to_string(),
+            };
+
+            content = content.push(text(hint).size(appearance::THEME_FONT_SIZE - 2.0));
+        }
 
         content.into()
     }
