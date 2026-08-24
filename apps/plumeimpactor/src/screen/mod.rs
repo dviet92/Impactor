@@ -8,7 +8,7 @@ mod windows;
 use std::collections::VecDeque;
 
 use iced::Length::Fill;
-use iced::widget::{button, column, container, pick_list, row, stack, text};
+use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, stack, text};
 use iced::window;
 use iced::{Element, Subscription, Task};
 
@@ -80,6 +80,18 @@ pub enum Message {
 
     // Installation
     StartInstallation,
+
+    // Multi install
+    MultiInstallToggleDevice(String),
+    MultiInstallSetAll(bool),
+    MultiInstallConfirm,
+    MultiInstallCancel,
+}
+
+/// Open state of the multi-install picker: which devices are ticked.
+#[derive(Debug, Default)]
+struct MultiInstallPrompt {
+    selected: std::collections::HashSet<String>,
 }
 
 pub struct Impactor {
@@ -98,6 +110,7 @@ pub struct Impactor {
     /// screen returns to the loaded package instead of the empty drop zone.
     parked_installer: Option<package::PackageScreen>,
     install_in_flight: bool,
+    multi_install: Option<MultiInstallPrompt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +164,7 @@ impl Impactor {
                 selected_locale,
                 parked_installer: None,
                 install_in_flight: false,
+                multi_install: None,
             },
             open_task,
         )
@@ -435,11 +449,16 @@ impl Impactor {
                         if self.pending_installation {
                             if matches!(msg, login_window::Message::LoginSuccess(_)) {
                                 self.pending_installation = false;
+                                let resume = if self.multi_install.is_some() {
+                                    Message::MultiInstallConfirm
+                                } else {
+                                    Message::InstallerScreen(
+                                        package::Message::RequestInstallation,
+                                    )
+                                };
                                 return Task::batch(vec![
                                     window::close(id),
-                                    Task::done(Message::InstallerScreen(
-                                        package::Message::RequestInstallation,
-                                    )),
+                                    Task::done(resume),
                                 ]);
                             }
                         }
@@ -643,6 +662,19 @@ impl Impactor {
 
                             self.start_installation_task()
                         }
+                        package::Message::RequestMultiInstallation => {
+                            if screen.selected_package.is_none() {
+                                return Task::none();
+                            }
+
+                            let mut selected = std::collections::HashSet::new();
+                            if let Some(device) = &self.selected_device {
+                                selected.insert(device.udid.clone());
+                            }
+
+                            self.multi_install = Some(MultiInstallPrompt { selected });
+                            Task::none()
+                        }
                         _ => screen.update(msg).map(Message::InstallerScreen),
                     }
                 } else {
@@ -798,6 +830,76 @@ impl Impactor {
                 Task::none()
             }
             Message::StartInstallation => Task::none(),
+            Message::MultiInstallToggleDevice(udid) => {
+                if let Some(prompt) = &mut self.multi_install {
+                    if !prompt.selected.remove(&udid) {
+                        prompt.selected.insert(udid);
+                    }
+                }
+                Task::none()
+            }
+            Message::MultiInstallSetAll(select_all) => {
+                if let Some(prompt) = &mut self.multi_install {
+                    prompt.selected.clear();
+                    if select_all {
+                        prompt
+                            .selected
+                            .extend(self.devices.iter().map(|device| device.udid.clone()));
+                    }
+                }
+                Task::none()
+            }
+            Message::MultiInstallCancel => {
+                self.multi_install = None;
+                Task::none()
+            }
+            Message::MultiInstallConfirm => {
+                let Some(prompt) = self.multi_install.as_ref() else {
+                    return Task::none();
+                };
+
+                let targets: Vec<Device> = self
+                    .devices
+                    .iter()
+                    .filter(|device| prompt.selected.contains(&device.udid))
+                    .cloned()
+                    .collect();
+
+                if targets.is_empty() {
+                    return Task::none();
+                }
+
+                // Signing with an Apple ID needs an account for every target. The
+                // store already falls back to the ticked account, so a gap here
+                // means no account is signed in at all.
+                let needs_login = match &self.current_screen {
+                    ImpactorScreen::Installer(installer) => {
+                        matches!(installer.options.mode, plume_utils::SignerMode::Pem)
+                            && targets.iter().any(|device| {
+                                self.account_store
+                                    .as_ref()
+                                    .and_then(|store| {
+                                        store.account_for_device(Some(device.udid.as_str()))
+                                    })
+                                    .is_none()
+                            })
+                    }
+                    _ => false,
+                };
+
+                if needs_login {
+                    // The picker stays open so the run resumes once they are in.
+                    self.pending_installation = true;
+
+                    let (login_window, task) = login_window::LoginWindow::new();
+                    let id = login_window.window_id().unwrap();
+                    self.login_windows.insert(id, login_window);
+                    return task.map(move |msg| Message::LoginWindowMessage(id, msg));
+                }
+
+                self.multi_install = None;
+                self.start_install_batch(targets.into_iter().map(Some).collect())
+            }
         }
     }
 
@@ -866,6 +968,8 @@ impl Impactor {
 
         if self.certificate_reset_queue.front().is_some() {
             stack![base, self.view_certificate_reset_prompt()].into()
+        } else if self.multi_install.is_some() {
+            stack![base, self.view_multi_install_prompt()].into()
         } else {
             base
         }
@@ -931,6 +1035,117 @@ impl Impactor {
         )
         .width(Fill)
         .into()
+    }
+
+    fn view_multi_install_prompt(&self) -> Element<'_, Message> {
+        let Some(prompt) = &self.multi_install else {
+            return container(text("")).into();
+        };
+
+        // Only worth showing the resolved account when it can differ per device.
+        let show_accounts = self
+            .account_store
+            .as_ref()
+            .is_some_and(|store| store.auto_select_account());
+
+        let entries = self.devices.iter().fold(
+            column![].spacing(appearance::THEME_PADDING),
+            |list, device| {
+                let udid = device.udid.clone();
+                let checked = prompt.selected.contains(&udid);
+
+                let mut entry = column![
+                    checkbox(checked)
+                        .label(device.to_string())
+                        .on_toggle(move |_| Message::MultiInstallToggleDevice(udid.clone()))
+                ]
+                .spacing(2);
+
+                if show_accounts {
+                    let account = self
+                        .account_store
+                        .as_ref()
+                        .and_then(|store| store.account_for_device(Some(device.udid.as_str())))
+                        .map(|account| account.email().clone())
+                        .unwrap_or_else(|| rust_i18n::t!("multi_install_no_account").to_string());
+
+                    entry = entry.push(text(account).size(appearance::THEME_FONT_SIZE - 2.0));
+                }
+
+                list.push(entry)
+            },
+        );
+
+        let count = prompt.selected.len();
+        let all_selected = !self.devices.is_empty()
+            && self
+                .devices
+                .iter()
+                .all(|device| prompt.selected.contains(&device.udid));
+
+        let toggle_all_label = if all_selected {
+            rust_i18n::t!("multi_install_clear")
+        } else {
+            rust_i18n::t!("multi_install_all")
+        };
+
+        let actions = row![
+            button(text(toggle_all_label))
+                .on_press(Message::MultiInstallSetAll(!all_selected))
+                .style(appearance::s_button),
+            container(text("")).width(Fill),
+            button(text(rust_i18n::t!("back")))
+                .on_press(Message::MultiInstallCancel)
+                .style(appearance::s_button),
+            button(text(
+                rust_i18n::t!("multi_install_start", count = count.to_string()).to_string()
+            ))
+            .on_press_maybe((count > 0).then_some(Message::MultiInstallConfirm))
+            .style(appearance::p_button),
+        ]
+        .spacing(appearance::THEME_PADDING)
+        .align_y(iced::Alignment::Center);
+
+        let body: Element<'_, Message> = if self.devices.is_empty() {
+            text(rust_i18n::t!("multi_install_no_devices")).into()
+        } else {
+            container(scrollable(entries)).max_height(220.0).into()
+        };
+
+        let dialog = container(
+            column![
+                text(rust_i18n::t!("multi_install")).size(appearance::THEME_FONT_SIZE + 2.0),
+                body,
+                actions,
+            ]
+            .spacing(appearance::THEME_PADDING),
+        )
+        .padding(appearance::THEME_PADDING * 2.0)
+        .max_width(500.0)
+        .style(|theme: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme.palette().background)),
+            border: iced::Border {
+                width: 1.0,
+                color: theme.palette().primary,
+                radius: appearance::THEME_CORNER_RADIUS.into(),
+            },
+            ..Default::default()
+        });
+
+        container(dialog)
+            .width(Fill)
+            .height(Fill)
+            .center(Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.45,
+                })),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_certificate_reset_prompt(&self) -> Element<'_, Message> {
@@ -1033,60 +1248,75 @@ impl Impactor {
     }
 
     fn start_installation_task(&mut self) -> Task<Message> {
-        if let ImpactorScreen::Installer(installer) = &self.current_screen {
-            let Some(package) = installer.selected_package.clone() else {
-                return Task::none();
-            };
+        let target = self.selected_device.clone();
+        self.start_install_batch(vec![target])
+    }
 
-            let device = self.selected_device.clone();
-            let options = installer.options.clone();
-            let account = self.account_for_selected_device().cloned();
-            let mut store = self.account_store.clone();
+    /// Runs the loaded package against each target in turn on a worker thread.
+    ///
+    /// A `None` target is the export path, which has no device at all. Every
+    /// target keeps its own account, resolved inside the batch, so a run can span
+    /// devices provisioned by different Apple IDs.
+    fn start_install_batch(&mut self, targets: Vec<Option<Device>>) -> Task<Message> {
+        let ImpactorScreen::Installer(installer) = &self.current_screen else {
+            return Task::none();
+        };
 
-            let (tx, rx) = std::sync::mpsc::channel();
-            let progress_rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let Some(package) = installer.selected_package.clone() else {
+            return Task::none();
+        };
 
-            let mut progress_screen = progress::ProgressScreen::new();
-            progress_screen.start_installation(progress_rx.clone());
-
-            if let ImpactorScreen::Installer(installer) = std::mem::replace(
-                &mut self.current_screen,
-                ImpactorScreen::Progress(progress_screen),
-            ) {
-                self.parked_installer = Some(installer);
-            }
-            self.install_in_flight = true;
-
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let tx_error = tx.clone();
-                rt.block_on(async move {
-                    match subscriptions::run_installation(
-                        &package,
-                        device.as_ref(),
-                        &options,
-                        account.as_ref(),
-                        store.as_mut(),
-                        &tx,
-                    )
-                    .await
-                    {
-                        // The staged copy is deliberately left in place. It is what
-                        // lets the user go back and install the same package to another
-                        // device, and it is cleaned up when they return to the drop zone.
-                        Ok(_) => {
-                            let _ = tx.send(("Installation complete!".to_string(), 100));
-                        }
-                        Err(e) => {
-                            let _ = tx_error.send((format!("Error: {}", e), -1));
-                        }
-                    }
-                });
-            });
-
-            Task::none()
+        let options = installer.options.clone();
+        let targets = if targets.is_empty() {
+            vec![None]
         } else {
-            Task::none()
+            targets
+        };
+        let count = targets.len();
+        let mut store = self.account_store.clone().unwrap_or_default();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let progress_rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+
+        let mut progress_screen = progress::ProgressScreen::new();
+        progress_screen.start_installation(progress_rx.clone());
+
+        if let ImpactorScreen::Installer(installer) = std::mem::replace(
+            &mut self.current_screen,
+            ImpactorScreen::Progress(progress_screen),
+        ) {
+            self.parked_installer = Some(installer);
         }
+        self.install_in_flight = true;
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let tx_error = tx.clone();
+            rt.block_on(async move {
+                // The staged copy is deliberately left in place. It is what lets the
+                // user go back and install the same package to another device, and it
+                // is cleaned up when they return to the drop zone.
+                match subscriptions::run_install_batch(
+                    &package, &targets, &options, &mut store, &tx,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let message = if count > 1 {
+                            rust_i18n::t!("multi_install_done", count = count.to_string())
+                                .to_string()
+                        } else {
+                            "Installation complete!".to_string()
+                        };
+                        let _ = tx.send((message, 100));
+                    }
+                    Err(e) => {
+                        let _ = tx_error.send((format!("Error: {}", e), -1));
+                    }
+                }
+            });
+        });
+
+        Task::none()
     }
 }

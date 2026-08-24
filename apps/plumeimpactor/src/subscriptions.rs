@@ -275,6 +275,99 @@ pub(crate) fn installation_progress_listener(
     }
 }
 
+/// Installs one package onto several devices, one after another.
+///
+/// Installs are sequential on purpose: they all talk to the same Apple developer
+/// account, share one certificate, and can each raise a certificate-reset prompt.
+///
+/// Each device gets its own account, resolved through the store, so the
+/// auto-select setting picks the Apple ID that already provisioned that device
+/// and falls back to the ticked one for devices it has never seen.
+///
+/// A device that fails does not abort the run; the batch finishes and reports
+/// everything that went wrong at the end.
+pub(crate) async fn run_install_batch(
+    package: &plume_utils::Package,
+    targets: &[Option<Device>],
+    options: &plume_utils::SignerOptions,
+    store: &mut plume_store::AccountStore,
+    tx: &std::sync::mpsc::Sender<(String, i32)>,
+) -> Result<(), String> {
+    let total = targets.len().max(1);
+    let mut failures: Vec<String> = Vec::new();
+    let mut installed = 0usize;
+
+    for (index, target) in targets.iter().enumerate() {
+        let account = store
+            .account_for_device(target.as_ref().map(|device| device.udid.as_str()))
+            .cloned();
+
+        let name = target
+            .as_ref()
+            .map(|device| device.name.clone())
+            .unwrap_or_default();
+
+        // Only label the steps when there is more than one target, so a plain
+        // single install reads exactly as it did before.
+        let label = if total > 1 {
+            Some(format!("[{}/{}] {}", index + 1, total, name))
+        } else {
+            None
+        };
+
+        // run_installation reports 0..=100 for its own work. Remap that onto this
+        // device's slice of the bar and hold it below 100, otherwise the first
+        // device finishing would look like the whole batch finishing.
+        let (device_tx, device_rx) = std::sync::mpsc::channel::<(String, i32)>();
+        let forward_to = tx.clone();
+        let base = index as f32 / total as f32 * 100.0;
+        let span = 100.0 / total as f32;
+        let forwarder = std::thread::spawn(move || {
+            while let Ok((message, progress)) = device_rx.recv() {
+                let progress = progress.clamp(0, 100) as f32;
+                let overall = (base + progress * span / 100.0).min(99.0) as i32;
+                let message = match &label {
+                    Some(label) => format!("{label} - {message}"),
+                    None => message,
+                };
+                let _ = forward_to.send((message, overall));
+            }
+        });
+
+        let result = run_installation(
+            package,
+            target.as_ref(),
+            options,
+            account.as_ref(),
+            Some(store),
+            &device_tx,
+        )
+        .await;
+
+        drop(device_tx);
+        let _ = forwarder.join();
+
+        match result {
+            Ok(()) => installed += 1,
+            Err(e) => {
+                log::error!("Install failed for {name}: {e}");
+                failures.push(format!("{name}: {e}"));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} of {} succeeded. {}",
+            installed,
+            total,
+            failures.join(" | ")
+        ))
+    }
+}
+
 pub(crate) async fn run_installation(
     package: &plume_utils::Package,
     device: Option<&Device>,

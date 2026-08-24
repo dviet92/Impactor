@@ -34,6 +34,7 @@ pub enum Message {
     ClearCustomEntitlements,
     Back,
     RequestInstallation,
+    RequestMultiInstallation,
 }
 
 #[derive(Debug, Clone)]
@@ -385,29 +386,42 @@ impl PackageScreen {
             SignerInstallMode::Export => (true, t!("export")),
         };
 
-        container(
-            row![
-                button(appearance::icon_text(
-                    appearance::CHEVRON_BACK,
-                    t!("back"),
-                    None
-                ))
-                .on_press(Message::Back)
-                .style(appearance::s_button)
-                .width(Fill),
+        let mut buttons = row![
+            button(appearance::icon_text(
+                appearance::CHEVRON_BACK,
+                t!("back"),
+                None
+            ))
+            .on_press(Message::Back)
+            .style(appearance::s_button)
+            .width(Fill),
+            button(appearance::icon_text(
+                appearance::DOWNLOAD,
+                button_label,
+                None
+            ))
+            .on_press_maybe(button_enabled.then_some(Message::RequestInstallation))
+            .style(appearance::p_button)
+            .width(Fill),
+        ]
+        .spacing(appearance::THEME_PADDING);
+
+        // Exporting produces a single file, so installing to several devices at
+        // once only makes sense in install mode.
+        if matches!(self.options.install_mode, SignerInstallMode::Install) {
+            buttons = buttons.push(
                 button(appearance::icon_text(
                     appearance::DOWNLOAD,
-                    button_label,
-                    None
+                    t!("multi_install"),
+                    None,
                 ))
-                .on_press_maybe(button_enabled.then_some(Message::RequestInstallation))
-                .style(appearance::p_button)
+                .on_press_maybe(has_device.then_some(Message::RequestMultiInstallation))
+                .style(appearance::s_button)
                 .width(Fill),
-            ]
-            .spacing(appearance::THEME_PADDING),
-        )
-        .width(Fill)
-        .into()
+            );
+        }
+
+        container(buttons).width(Fill).into()
     }
 
     fn view_custom_entitlements(&self) -> Element<'_, Message> {
