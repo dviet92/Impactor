@@ -286,6 +286,32 @@ pub(crate) fn installation_progress_listener(
 ///
 /// A device that fails does not abort the run; the batch finishes and reports
 /// everything that went wrong at the end.
+/// Recognises "this Apple ID has no room left" from the developer API.
+///
+/// A free account caps both registered devices and App IDs per week, and either
+/// cap means the same thing here: nothing more can be signed with this ID, so
+/// move to the next one. The session asks Apple for `en-us`, but the exact
+/// wording differs between the two limits and has changed over time, so match on
+/// the shape of the message rather than on one fixed string. A false positive
+/// only costs a retry on another account.
+fn is_account_full_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    let capped = message.contains("maximum")
+        || message.contains("limit")
+        || message.contains("too many")
+        || message.contains("exceeded");
+
+    let subject = message.contains("device")
+        || message.contains("app id")
+        || message.contains("appid")
+        || message.contains("register")
+        // The free-account app cap words it differently again.
+        || message.contains("free development profile");
+
+    capped && subject
+}
+
 pub(crate) async fn run_install_batch(
     package: &plume_utils::Package,
     targets: &[Option<Device>],
@@ -297,11 +323,10 @@ pub(crate) async fn run_install_batch(
     let mut failures: Vec<String> = Vec::new();
     let mut installed = 0usize;
 
-    for (index, target) in targets.iter().enumerate() {
-        let account = store
-            .account_for_device(target.as_ref().map(|device| device.udid.as_str()))
-            .cloned();
+    let auto_select = store.auto_select_account();
 
+    for (index, target) in targets.iter().enumerate() {
+        let udid = target.as_ref().map(|device| device.udid.as_str());
         let name = target
             .as_ref()
             .map(|device| device.name.clone())
@@ -315,39 +340,89 @@ pub(crate) async fn run_install_batch(
             None
         };
 
-        // run_installation reports 0..=100 for its own work. Remap that onto this
-        // device's slice of the bar and hold it below 100, otherwise the first
-        // device finishing would look like the whole batch finishing.
-        let (device_tx, device_rx) = std::sync::mpsc::channel::<(String, i32)>();
-        let forward_to = tx.clone();
         let base = index as f32 / total as f32 * 100.0;
         let span = 100.0 / total as f32;
-        let forwarder = std::thread::spawn(move || {
-            while let Ok((message, progress)) = device_rx.recv() {
-                let progress = progress.clamp(0, 100) as f32;
-                let overall = (base + progress * span / 100.0).min(99.0) as i32;
-                let message = match &label {
+
+        // Apple IDs this device already tried and that came back full.
+        let mut refused: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let outcome = loop {
+            let account = store
+                .auto_account_for_device(udid, chrono::Utc::now(), &refused)
+                .cloned();
+
+            if account.is_none() && !refused.is_empty() {
+                break Err(format!(
+                    "no Apple ID left with room for this device (tried {})",
+                    refused.len()
+                ));
+            }
+
+            // run_installation reports 0..=100 for its own work. Remap that onto
+            // this device's slice of the bar and hold it below 100, otherwise the
+            // first device finishing would look like the whole batch finishing.
+            let (device_tx, device_rx) = std::sync::mpsc::channel::<(String, i32)>();
+            let forward_to = tx.clone();
+            let step_label = label.clone();
+            let forwarder = std::thread::spawn(move || {
+                while let Ok((message, progress)) = device_rx.recv() {
+                    let progress = progress.clamp(0, 100) as f32;
+                    let overall = (base + progress * span / 100.0).min(99.0) as i32;
+                    let message = match &step_label {
+                        Some(label) => format!("{label} - {message}"),
+                        None => message,
+                    };
+                    let _ = forward_to.send((message, overall));
+                }
+            });
+
+            let result = run_installation(
+                package,
+                target.as_ref(),
+                options,
+                account.as_ref(),
+                Some(&mut *store),
+                &device_tx,
+            )
+            .await;
+
+            drop(device_tx);
+            let _ = forwarder.join();
+
+            let Err(e) = result else {
+                break Ok(());
+            };
+
+            // A full Apple ID is not a real failure while auto-select is on:
+            // there may be another one with room, so try it instead of giving up
+            // on this device. With auto-select off the user picked the account
+            // deliberately and swapping it behind their back would be wrong.
+            let switchable = auto_select && account.is_some() && is_account_full_error(&e);
+
+            if !switchable {
+                break Err(e);
+            }
+
+            let email = account
+                .as_ref()
+                .map(|account| account.email().clone())
+                .unwrap_or_default();
+
+            log::warn!("Apple ID {email} is full for {name}: {e}");
+
+            let message = format!("{email} is full, trying another Apple ID...");
+            let _ = tx.send((
+                match &label {
                     Some(label) => format!("{label} - {message}"),
                     None => message,
-                };
-                let _ = forward_to.send((message, overall));
-            }
-        });
+                },
+                base as i32,
+            ));
 
-        let result = run_installation(
-            package,
-            target.as_ref(),
-            options,
-            account.as_ref(),
-            Some(store),
-            &device_tx,
-        )
-        .await;
+            refused.insert(email);
+        };
 
-        drop(device_tx);
-        let _ = forwarder.join();
-
-        match result {
+        match outcome {
             Ok(()) => installed += 1,
             Err(e) => {
                 log::error!("Install failed for {name}: {e}");

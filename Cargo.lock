@@ -5658,6 +5658,7 @@ name = "plume_store"
 version = "2.6.0"
 dependencies = [
  "chrono",
+ "log",
  "plume_core",
  "serde",
  "serde_json",

@@ -1,11 +1,59 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use plume_core::Error;
 
 use crate::{GsaAccount, RefreshDevice};
+
+/// A free Apple ID's signing certificate is good for 7 days. Past that the apps
+/// it signed are dead anyway, so the install no longer counts for anything.
+pub const AUTO_ACCOUNT_WINDOW_DAYS: i64 = 7;
+
+/// How many devices one Apple ID is allowed to carry inside that window before
+/// auto-select stops handing it new ones.
+pub const AUTO_ACCOUNT_MAX_DEVICES: usize = 3;
+
+/// A successful install: which Apple ID did it, and when.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInstall {
+    pub email: String,
+    pub installed_at: DateTime<Utc>,
+}
+
+/// Value stored per device.
+///
+/// Configs written before install times were tracked hold a bare email string,
+/// so both shapes have to deserialize. Those are dated on load; see
+/// [`AccountStore::stamp_undated_entries`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum DeviceAccountEntry {
+    Dated(DeviceInstall),
+    Undated(String),
+}
+
+impl DeviceAccountEntry {
+    fn email(&self) -> &str {
+        match self {
+            Self::Dated(install) => install.email.as_str(),
+            Self::Undated(email) => email.as_str(),
+        }
+    }
+
+    fn installed_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Dated(install) => Some(install.installed_at),
+            Self::Undated(_) => None,
+        }
+    }
+
+    fn is_within(&self, cutoff: DateTime<Utc>) -> bool {
+        self.installed_at().is_some_and(|at| at > cutoff)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct AccountStore {
@@ -14,7 +62,7 @@ pub struct AccountStore {
     #[serde(default)]
     refreshes: HashMap<String, RefreshDevice>, // UDID -> RefreshDevice (apps?)
     #[serde(default)]
-    device_accounts: HashMap<String, String>, // UDID -> email that last installed successfully
+    device_accounts: HashMap<String, DeviceAccountEntry>, // UDID -> who installed, and when
     #[serde(default)]
     auto_select_account: bool, // prefer `device_accounts` over `selected_account` when installing
     #[serde(default)]
@@ -33,6 +81,11 @@ impl AccountStore {
                 serde_json::from_str(&contents)?
             };
             settings.path = Some(path.clone());
+
+            if settings.stamp_undated_entries(Utc::now()) {
+                settings.save().await?;
+            }
+
             Ok(settings)
         } else {
             Ok(Self::default())
@@ -48,6 +101,14 @@ impl AccountStore {
                 serde_json::from_str(&contents)?
             };
             settings.path = Some(path.clone());
+
+            if settings.stamp_undated_entries(Utc::now()) {
+                // Best effort: a store we cannot write is still usable this run.
+                if let Err(e) = settings.save_sync() {
+                    log::warn!("Failed to persist install times for older entries: {e}");
+                }
+            }
+
             Ok(settings)
         } else {
             Ok(Self::default())
@@ -118,7 +179,7 @@ impl AccountStore {
             self.selected_account = None;
         }
         // Otherwise auto-select would keep pointing devices at an account that is gone.
-        self.device_accounts.retain(|_, stored| stored != email);
+        self.device_accounts.retain(|_, entry| entry.email() != email);
     }
 
     pub async fn account_select(&mut self, email: &str) -> Result<(), Error> {
@@ -243,26 +304,89 @@ impl AccountStore {
     }
 
     /// Email of the account that last installed successfully onto `udid`.
-    pub fn device_account_email(&self, udid: &str) -> Option<&String> {
-        self.device_accounts.get(udid)
+    pub fn device_account_email(&self, udid: &str) -> Option<&str> {
+        self.device_accounts.get(udid).map(DeviceAccountEntry::email)
     }
 
-    /// Records that `email` installed successfully onto `udid`.
-    ///
-    /// Writing the store is skipped when nothing changed, so the common case of
-    /// reinstalling with the same account does not touch the disk.
+    /// When that install happened, if the entry predates install-time tracking.
+    pub fn device_installed_at(&self, udid: &str) -> Option<DateTime<Utc>> {
+        self.device_accounts
+            .get(udid)
+            .and_then(DeviceAccountEntry::installed_at)
+    }
+
+    /// Records that `email` installed successfully onto `udid`, right now.
     pub fn record_device_account_sync(&mut self, udid: &str, email: &str) -> Result<(), Error> {
+        self.record_device_account_at_sync(udid, email, Utc::now())
+    }
+
+    /// Same, with an explicit timestamp. Exists so the selection rules can be
+    /// tested against a fixed clock.
+    pub fn record_device_account_at_sync(
+        &mut self,
+        udid: &str,
+        email: &str,
+        installed_at: DateTime<Utc>,
+    ) -> Result<(), Error> {
         if udid.is_empty() || !self.accounts.contains_key(email) {
             return Ok(());
         }
 
-        if self.device_accounts.get(udid).map(String::as_str) == Some(email) {
-            return Ok(());
+        self.device_accounts.insert(
+            udid.to_string(),
+            DeviceAccountEntry::Dated(DeviceInstall {
+                email: email.to_string(),
+                installed_at,
+            }),
+        );
+        self.save_sync()
+    }
+
+    /// Distinct devices this account has installed onto since `cutoff`.
+    ///
+    /// Undated entries never count: there is no way to tell whether they fall
+    /// inside the window.
+    pub fn devices_installed_since(&self, email: &str, cutoff: DateTime<Utc>) -> usize {
+        self.device_accounts
+            .values()
+            .filter(|entry| entry.email() == email && entry.is_within(cutoff))
+            .count()
+    }
+
+    /// Devices this account is currently carrying inside the 7-day window.
+    pub fn devices_in_window(&self, email: &str) -> usize {
+        self.devices_installed_since(email, Self::window_cutoff(Utc::now()))
+    }
+
+    fn window_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
+        now - Duration::days(AUTO_ACCOUNT_WINDOW_DAYS)
+    }
+
+    /// Dates entries written before install times were tracked.
+    ///
+    /// An undated entry still means "this Apple ID installed here". Leaving it
+    /// undated would push the device down to the spread-the-load rule and move
+    /// it onto some other account, which is the wrong answer for a device that
+    /// already has one. Dating it to the moment it is first read keeps it where
+    /// it is, and persisting that stamp means it ages out after the usual seven
+    /// days rather than being renewed on every launch.
+    ///
+    /// Returns whether anything changed, so the caller only writes when needed.
+    fn stamp_undated_entries(&mut self, now: DateTime<Utc>) -> bool {
+        let mut changed = false;
+
+        for entry in self.device_accounts.values_mut() {
+            if let DeviceAccountEntry::Undated(email) = entry {
+                let email = std::mem::take(email);
+                *entry = DeviceAccountEntry::Dated(DeviceInstall {
+                    email,
+                    installed_at: now,
+                });
+                changed = true;
+            }
         }
 
-        self.device_accounts
-            .insert(udid.to_string(), email.to_string());
-        self.save_sync()
+        changed
     }
 
     pub fn forget_device_account_sync(&mut self, udid: &str) -> Result<(), Error> {
@@ -273,21 +397,77 @@ impl AccountStore {
     }
 
     /// The account an install targeting `udid` should use.
-    ///
-    /// With auto-select on, the account remembered for that device wins; anything
-    /// else (auto-select off, unknown device, or a remembered account that has since
-    /// been removed) falls back to the manually selected account.
     pub fn account_for_device(&self, udid: Option<&str>) -> Option<&GsaAccount> {
-        if self.auto_select_account {
-            if let Some(account) = udid
-                .filter(|udid| !udid.is_empty())
-                .and_then(|udid| self.device_accounts.get(udid))
-                .and_then(|email| self.accounts.get(email))
-            {
-                return Some(account);
-            }
+        self.auto_account_for_device(udid, Utc::now(), &HashSet::new())
+    }
+
+    /// The account an install targeting `udid` should use, with auto-select rules
+    /// evaluated against `now` and skipping every email in `refused`.
+    ///
+    /// `refused` carries the accounts an in-progress run already tried and found
+    /// full, so a retry lands on a different one.
+    ///
+    /// With auto-select on the order is:
+    ///
+    /// 1. the account that already provisioned this device, while its 7-day
+    ///    certificate window is still open, so the device stays on one Apple ID
+    ///    instead of burning a slot on another;
+    /// 2. otherwise the account carrying the fewest devices in that window, and
+    ///    only while it is under the per-account cap, which spreads devices out
+    ///    rather than filling one ID and then failing;
+    /// 3. otherwise the account ticked in Settings, so auto-select never leaves
+    ///    the user with nothing at all.
+    ///
+    /// With auto-select off it is always the ticked account.
+    pub fn auto_account_for_device(
+        &self,
+        udid: Option<&str>,
+        now: DateTime<Utc>,
+        refused: &HashSet<String>,
+    ) -> Option<&GsaAccount> {
+        let not_refused = |account: &&GsaAccount| !refused.contains(account.email());
+
+        if !self.auto_select_account {
+            return self.selected_account().filter(not_refused);
         }
 
-        self.selected_account()
+        let cutoff = Self::window_cutoff(now);
+
+        // 1. Stay on the Apple ID this device is already signed with.
+        if let Some(account) = udid
+            .filter(|udid| !udid.is_empty())
+            .and_then(|udid| self.device_accounts.get(udid))
+            .filter(|entry| entry.is_within(cutoff))
+            .and_then(|entry| self.accounts.get(entry.email()))
+            .filter(not_refused)
+        {
+            return Some(account);
+        }
+
+        // 2. Spread the load across the accounts that still have room.
+        let mut candidates: Vec<(&str, &GsaAccount, usize)> = self
+            .accounts
+            .iter()
+            .filter(|(email, _)| !refused.contains(*email))
+            .map(|(email, account)| {
+                (
+                    email.as_str(),
+                    account,
+                    self.devices_installed_since(email, cutoff),
+                )
+            })
+            .filter(|(_, _, used)| *used < AUTO_ACCOUNT_MAX_DEVICES)
+            .collect();
+
+        // Least loaded first, then by email so the pick does not depend on the
+        // hash map's iteration order.
+        candidates.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(b.0)));
+
+        if let Some((_, account, _)) = candidates.first() {
+            return Some(account);
+        }
+
+        // 3. Everything is full or unknown: use whatever is ticked.
+        self.selected_account().filter(not_refused)
     }
 }

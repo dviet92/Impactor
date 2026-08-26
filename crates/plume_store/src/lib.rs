@@ -3,4 +3,6 @@ mod refresh;
 mod store;
 pub use gsa_account::{GsaAccount, account_from_session};
 pub use refresh::{RefreshApp, RefreshDevice};
-pub use store::AccountStore;
+pub use store::{
+    AUTO_ACCOUNT_MAX_DEVICES, AUTO_ACCOUNT_WINDOW_DAYS, AccountStore, DeviceInstall,
+};

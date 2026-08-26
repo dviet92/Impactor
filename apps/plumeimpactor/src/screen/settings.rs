@@ -137,8 +137,22 @@ impl SettingsScreen {
                         appearance::s_button
                     };
 
+                    // With auto-select on, the cap is what decides where the next
+                    // device lands, so show how much room each account has left.
+                    let label = if store.auto_select_account() {
+                        format!(
+                            "{}{}  ({}/{})",
+                            marker,
+                            account.email(),
+                            store.devices_in_window(email),
+                            plume_store::AUTO_ACCOUNT_MAX_DEVICES
+                        )
+                    } else {
+                        format!("{}{}", marker, account.email())
+                    };
+
                     let account_button = button(
-                        text(format!("{}{}", marker, account.email()))
+                        text(label)
                             .size(appearance::THEME_FONT_SIZE)
                             .align_x(Alignment::Start),
                     )
@@ -223,15 +237,14 @@ impl SettingsScreen {
         .spacing(appearance::THEME_PADDING);
 
         if enabled {
+            // Ask for the real answer rather than reading the stored email, so
+            // this line reflects the whole rule chain, not just rule one.
             let hint = match selected_device.filter(|device| !device.udid.is_empty()) {
-                Some(device) => match store
-                    .device_account_email(&device.udid)
-                    .filter(|email| store.get_account(email).is_some())
-                {
-                    Some(email) => t!(
+                Some(device) => match store.account_for_device(Some(device.udid.as_str())) {
+                    Some(account) => t!(
                         "settings_auto_account_known",
                         device = device.name.as_str(),
-                        account = email.as_str()
+                        account = account.email().as_str()
                     )
                     .to_string(),
                     None => t!("settings_auto_account_unknown", device = device.name.as_str())
