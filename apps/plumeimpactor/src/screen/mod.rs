@@ -8,7 +8,9 @@ mod windows;
 use std::collections::VecDeque;
 
 use iced::Length::Fill;
-use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, stack, text};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, scrollable, stack, text, text_editor,
+};
 use iced::window;
 use iced::{Element, Subscription, Task};
 
@@ -86,6 +88,150 @@ pub enum Message {
     MultiInstallSetAll(bool),
     MultiInstallConfirm,
     MultiInstallCancel,
+
+    // Bulk account add
+    BulkAddShow,
+    BulkAddEdit(text_editor::Action),
+    BulkAddConfirm,
+    BulkAddCancel,
+    BulkAddNext,
+    BulkAddOpen(BulkCredential, usize, usize),
+}
+
+/// How long to wait between sign-ins during a bulk run.
+///
+/// Signing several Apple IDs in from one machine back to back looks like abuse
+/// to Apple: the sessions get invalidated and the accounts can be locked, which
+/// then needs a manual unlock on appleid.apple.com. Spacing the attempts out
+/// costs a couple of minutes and avoids that.
+const BULK_LOGIN_GAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One line of the pasted account list.
+#[derive(Clone)]
+pub struct BulkCredential {
+    email: String,
+    password: String,
+}
+
+impl std::fmt::Debug for BulkCredential {
+    /// Hand written so a derived `Debug` can never put a password in a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BulkCredential")
+            .field("email", &self.email)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Splits a pasted list into credentials, one per line.
+///
+/// A line is `email|password` or `email<TAB>password`, split at the first
+/// separator so a password containing `|` survives (an email cannot contain
+/// one). Blank lines and `#` comments are ignored. Whitespace is trimmed off
+/// both halves, which matters because lists pasted on Windows carry a trailing
+/// `\r` on every line.
+///
+/// Returns the credentials in file order plus the lines that could not be read,
+/// so the user is told which ones were dropped instead of silently losing them.
+fn parse_bulk_credentials(input: &str) -> (Vec<BulkCredential>, Vec<String>) {
+    let mut credentials = Vec::new();
+    let mut malformed = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in input.lines() {
+        let line = line.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some(split_at) = line.find(['|', '\t']) else {
+            malformed.push(line.to_string());
+            continue;
+        };
+
+        let (email, password) = line.split_at(split_at);
+        let email = email.trim();
+        let password = password[1..].trim();
+
+        if email.is_empty() || password.is_empty() {
+            malformed.push(line.to_string());
+            continue;
+        }
+
+        // Apple treats the address case-insensitively, so a list holding the
+        // same account twice in different cases is still a duplicate.
+        if !seen.insert(email.to_ascii_lowercase()) {
+            continue;
+        }
+
+        credentials.push(BulkCredential {
+            email: email.to_string(),
+            password: password.to_string(),
+        });
+    }
+
+    (credentials, malformed)
+}
+
+/// Open state of the paste box.
+#[derive(Default)]
+struct BulkAddPrompt {
+    content: text_editor::Content,
+    error: Option<String>,
+}
+
+/// A bulk add in progress: what is left, and what happened so far.
+#[derive(Debug, Default)]
+struct BulkAddQueue {
+    pending: VecDeque<BulkCredential>,
+    current: Option<String>,
+    added: Vec<String>,
+    failed: Vec<String>,
+    skipped: Vec<String>,
+    cancelled: bool,
+}
+
+impl BulkAddQueue {
+    /// What to show once the run stops, either finished or cancelled.
+    fn summary(&self) -> String {
+        let mut lines = vec![rust_i18n::t!(
+            "bulk_add_summary_counts",
+            added = self.added.len().to_string(),
+            skipped = self.skipped.len().to_string(),
+            failed = self.failed.len().to_string()
+        )
+        .to_string()];
+
+        if !self.skipped.is_empty() {
+            lines.push(String::new());
+            lines.push(rust_i18n::t!("bulk_add_summary_skipped").to_string());
+            lines.extend(self.skipped.iter().map(|email| format!("  {email}")));
+        }
+
+        if !self.failed.is_empty() {
+            lines.push(String::new());
+            lines.push(rust_i18n::t!("bulk_add_summary_failed").to_string());
+            lines.extend(self.failed.iter().map(|entry| format!("  {entry}")));
+        }
+
+        if !self.pending.is_empty() {
+            lines.push(String::new());
+            lines.push(
+                rust_i18n::t!(
+                    "bulk_add_summary_not_attempted",
+                    count = self.pending.len().to_string()
+                )
+                .to_string(),
+            );
+            lines.extend(
+                self.pending
+                    .iter()
+                    .map(|credential| format!("  {}", credential.email)),
+            );
+        }
+
+        lines.join("\n")
+    }
 }
 
 /// Open state of the multi-install picker: which devices are ticked.
@@ -111,6 +257,9 @@ pub struct Impactor {
     parked_installer: Option<package::PackageScreen>,
     install_in_flight: bool,
     multi_install: Option<MultiInstallPrompt>,
+    bulk_add: Option<BulkAddPrompt>,
+    bulk_queue: Option<BulkAddQueue>,
+    bulk_waiting: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,6 +314,9 @@ impl Impactor {
                 parked_installer: None,
                 install_in_flight: false,
                 multi_install: None,
+                bulk_add: None,
+                bulk_queue: None,
+                bulk_waiting: false,
             },
             open_task,
         )
@@ -432,6 +584,52 @@ impl Impactor {
                 if let Some(login_window) = self.login_windows.get_mut(&id) {
                     let task = login_window.update(msg.clone());
 
+                    // During a bulk run every outcome is terminal for that
+                    // account: the window drops its two-factor channel on
+                    // failure, so there is nothing left to retry in place.
+                    if self.bulk_queue.is_some() {
+                        let advance = match &msg {
+                            login_window::Message::LoginSuccess(account) => {
+                                let email = account.email().clone();
+                                if let Some(queue) = &mut self.bulk_queue {
+                                    queue.current = None;
+                                    queue.added.push(email);
+                                }
+                                true
+                            }
+                            login_window::Message::LoginFailed(error) => {
+                                let error = error.clone();
+                                if let Some(queue) = &mut self.bulk_queue {
+                                    if let Some(email) = queue.current.take() {
+                                        queue.failed.push(format!("{email}: {error}"));
+                                    }
+                                }
+                                true
+                            }
+                            login_window::Message::LoginCancel
+                            | login_window::Message::TwoFactorCancel => {
+                                // Cancel stops the whole list, not just this
+                                // account; the rest are reported as untouched.
+                                if let Some(queue) = &mut self.bulk_queue {
+                                    queue.current = None;
+                                    queue.cancelled = true;
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+
+                        if advance {
+                            self.login_windows.remove(&id);
+                            self.account_store = Some(Self::init_account_store_sync());
+
+                            return Task::batch(vec![
+                                window::close(id),
+                                Task::done(Message::BulkAddNext),
+                            ]);
+                        }
+                    }
+
                     if matches!(
                         msg,
                         login_window::Message::LoginSuccess(_)
@@ -610,6 +808,7 @@ impl Impactor {
                             }
                             screen.update(msg).map(Message::SettingsScreen)
                         }
+                        settings::Message::ShowBulkAdd => Task::done(Message::BulkAddShow),
                         settings::Message::ToggleAutoAccount(enabled) => {
                             if let Some(store) = &mut self.account_store {
                                 if let Err(err) = store.set_auto_select_account_sync(enabled) {
@@ -853,6 +1052,155 @@ impl Impactor {
                 self.multi_install = None;
                 Task::none()
             }
+            Message::BulkAddShow => {
+                self.bulk_add = Some(BulkAddPrompt::default());
+                Task::none()
+            }
+            Message::BulkAddEdit(action) => {
+                if let Some(prompt) = &mut self.bulk_add {
+                    prompt.content.perform(action);
+                    prompt.error = None;
+                }
+                Task::none()
+            }
+            Message::BulkAddCancel => {
+                self.bulk_add = None;
+                Task::none()
+            }
+            Message::BulkAddConfirm => {
+                let Some(prompt) = &mut self.bulk_add else {
+                    return Task::none();
+                };
+
+                let (credentials, malformed) = parse_bulk_credentials(&prompt.content.text());
+
+                if credentials.is_empty() {
+                    // Keep the box open with what they pasted still in it.
+                    prompt.error = Some(if malformed.is_empty() {
+                        rust_i18n::t!("bulk_add_empty").to_string()
+                    } else {
+                        rust_i18n::t!(
+                            "bulk_add_no_valid_lines",
+                            count = malformed.len().to_string()
+                        )
+                        .to_string()
+                    });
+                    return Task::none();
+                }
+
+                // Accounts already signed in are left alone rather than being
+                // signed in again, which would cost a round trip per account and
+                // reset nothing useful.
+                let existing: std::collections::HashSet<String> = self
+                    .account_store
+                    .as_ref()
+                    .map(|store| {
+                        store
+                            .accounts()
+                            .keys()
+                            .map(|email| email.to_ascii_lowercase())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let mut queue = BulkAddQueue::default();
+
+                for credential in credentials {
+                    if existing.contains(&credential.email.to_ascii_lowercase()) {
+                        queue.skipped.push(credential.email);
+                    } else {
+                        queue.pending.push_back(credential);
+                    }
+                }
+
+                queue.failed.extend(
+                    malformed
+                        .into_iter()
+                        .map(|line| rust_i18n::t!("bulk_add_bad_line", line = line).to_string()),
+                );
+
+                self.bulk_add = None;
+                self.bulk_queue = Some(queue);
+
+                Task::done(Message::BulkAddNext)
+            }
+            Message::BulkAddNext => {
+                let Some(queue) = &mut self.bulk_queue else {
+                    return Task::none();
+                };
+
+                let next = if queue.cancelled {
+                    None
+                } else {
+                    queue.pending.pop_front()
+                };
+
+                let Some(credential) = next else {
+                    let summary = queue.summary();
+                    self.bulk_queue = None;
+                    self.bulk_waiting = false;
+                    self.account_store = Some(Self::init_account_store_sync());
+
+                    if let ImpactorScreen::Settings(_) = self.current_screen {
+                        self.current_screen =
+                            ImpactorScreen::Settings(settings::SettingsScreen::new());
+                    }
+
+                    // Off the UI thread: rfd's dialog blocks until dismissed.
+                    std::thread::spawn(move || {
+                        rfd::MessageDialog::new()
+                            .set_title(&rust_i18n::t!("bulk_add_title").to_string())
+                            .set_description(&summary)
+                            .set_buttons(rfd::MessageButtons::Ok)
+                            .show();
+                    });
+
+                    return Task::none();
+                };
+
+                // Count only the accounts actually being signed in. `total`
+                // includes the ones skipped as already present, so subtracting
+                // from it would start the count part way through the list.
+                let attempted = queue.added.len() + queue.failed.len() + 1;
+                let to_attempt = attempted + queue.pending.len();
+                queue.current = Some(credential.email.clone());
+
+                let open = Message::BulkAddOpen(credential, attempted, to_attempt);
+
+                if attempted == 1 {
+                    return Task::done(open);
+                }
+
+                // Space the sign-ins out. Sleeping on a thread and waking the
+                // task through a oneshot keeps the UI responsive and avoids
+                // needing a tokio runtime on the executor.
+                self.bulk_waiting = true;
+
+                let (ready_tx, ready_rx) = iced::futures::channel::oneshot::channel::<()>();
+                std::thread::spawn(move || {
+                    std::thread::sleep(BULK_LOGIN_GAP);
+                    let _ = ready_tx.send(());
+                });
+
+                Task::perform(async move { ready_rx.await.ok() }, move |_| open.clone())
+            }
+            Message::BulkAddOpen(credential, index, total) => {
+                self.bulk_waiting = false;
+
+                if self.bulk_queue.is_none() {
+                    return Task::none();
+                }
+
+                let (login_window, task) = login_window::LoginWindow::new_for_queue(
+                    credential.email,
+                    credential.password,
+                    (index, total),
+                );
+                let id = login_window.window_id().unwrap();
+                self.login_windows.insert(id, login_window);
+
+                task.map(move |msg| Message::LoginWindowMessage(id, msg))
+            }
             Message::MultiInstallConfirm => {
                 let Some(prompt) = self.multi_install.as_ref() else {
                     return Task::none();
@@ -964,12 +1312,20 @@ impl Impactor {
         let base: Element<'_, Message> =
             container(column(vec![top_bar, screen_content]).spacing(appearance::THEME_PADDING))
                 .padding(appearance::THEME_PADDING)
+                // Fill the window so an overlaid dialog gets the whole area to
+                // centre itself in; otherwise a short screen clips it.
+                .width(Fill)
+                .height(Fill)
                 .into();
 
         if self.certificate_reset_queue.front().is_some() {
             stack![base, self.view_certificate_reset_prompt()].into()
         } else if self.multi_install.is_some() {
             stack![base, self.view_multi_install_prompt()].into()
+        } else if self.bulk_waiting {
+            stack![base, self.view_bulk_waiting()].into()
+        } else if self.bulk_add.is_some() {
+            stack![base, self.view_bulk_add_prompt()].into()
         } else {
             base
         }
@@ -1035,6 +1391,114 @@ impl Impactor {
         )
         .width(Fill)
         .into()
+    }
+
+    /// Shown between sign-ins, when no login window is up and the app would
+    /// otherwise look frozen.
+    fn view_bulk_waiting(&self) -> Element<'_, Message> {
+        let dialog = container(
+            column![
+                text(rust_i18n::t!("bulk_add_waiting")).size(appearance::THEME_FONT_SIZE + 2.0),
+                text(rust_i18n::t!(
+                    "bulk_add_waiting_why",
+                    seconds = BULK_LOGIN_GAP.as_secs().to_string()
+                ))
+                .size(appearance::THEME_FONT_SIZE - 2.0),
+            ]
+            .spacing(appearance::THEME_PADDING),
+        )
+        .padding(appearance::THEME_PADDING * 2.0)
+        .max_width(420.0)
+        .style(|theme: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme.palette().background)),
+            border: iced::Border {
+                width: 1.0,
+                color: theme.palette().primary,
+                radius: appearance::THEME_CORNER_RADIUS.into(),
+            },
+            ..Default::default()
+        });
+
+        container(dialog)
+            .width(Fill)
+            .height(Fill)
+            .center(Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.45,
+                })),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_bulk_add_prompt(&self) -> Element<'_, Message> {
+        let Some(prompt) = &self.bulk_add else {
+            return container(text("")).into();
+        };
+
+        let editor = text_editor(&prompt.content)
+            .placeholder(rust_i18n::t!("bulk_add_placeholder"))
+            .on_action(Message::BulkAddEdit)
+            .height(160.0);
+
+        let mut body = column![
+            text(rust_i18n::t!("bulk_add_title")).size(appearance::THEME_FONT_SIZE + 2.0),
+            text(rust_i18n::t!("bulk_add_hint")).size(appearance::THEME_FONT_SIZE - 2.0),
+            editor,
+        ]
+        .spacing(appearance::THEME_PADDING);
+
+        if let Some(error) = &prompt.error {
+            body = body.push(text(error).style(|_theme| iced::widget::text::Style {
+                color: Some(iced::Color::from_rgb(1.0, 0.3, 0.3)),
+            }));
+        }
+
+        body = body.push(
+            row![
+                container(text("")).width(Fill),
+                button(text(rust_i18n::t!("cancel")))
+                    .on_press(Message::BulkAddCancel)
+                    .style(appearance::s_button),
+                button(text(rust_i18n::t!("bulk_add_start")))
+                    .on_press(Message::BulkAddConfirm)
+                    .style(appearance::p_button),
+            ]
+            .spacing(appearance::THEME_PADDING)
+            .align_y(iced::Alignment::Center),
+        );
+
+        let dialog = container(body)
+            .padding(appearance::THEME_PADDING * 2.0)
+            .max_width(500.0)
+            .style(|theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme.palette().background)),
+                border: iced::Border {
+                    width: 1.0,
+                    color: theme.palette().primary,
+                    radius: appearance::THEME_CORNER_RADIUS.into(),
+                },
+                ..Default::default()
+            });
+
+        container(dialog)
+            .width(Fill)
+            .height(Fill)
+            .center(Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.45,
+                })),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_multi_install_prompt(&self) -> Element<'_, Message> {

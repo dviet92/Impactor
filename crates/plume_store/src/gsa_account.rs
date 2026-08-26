@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -8,6 +9,12 @@ pub struct GsaAccount {
     xcode_gs_token: String,
     #[serde(default)]
     team_id: String,
+    /// When this account was first added.
+    ///
+    /// Accounts stored before this was tracked have none. They all predate every
+    /// account that does carry a date, so "unknown" sorts as oldest.
+    #[serde(default)]
+    added_at: Option<DateTime<Utc>>,
 }
 
 impl GsaAccount {
@@ -24,6 +31,7 @@ impl GsaAccount {
             adsid,
             xcode_gs_token,
             team_id,
+            added_at: Some(Utc::now()),
         }
     }
     pub fn email(&self) -> &String {
@@ -43,6 +51,12 @@ impl GsaAccount {
     }
     pub fn set_team_id(&mut self, team_id: String) {
         self.team_id = team_id;
+    }
+    pub fn added_at(&self) -> Option<DateTime<Utc>> {
+        self.added_at
+    }
+    pub fn set_added_at(&mut self, added_at: Option<DateTime<Utc>>) {
+        self.added_at = added_at;
     }
 }
 

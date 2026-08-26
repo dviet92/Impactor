@@ -312,6 +312,52 @@ fn is_account_full_error(message: &str) -> bool {
     capped && subject
 }
 
+/// Recognises a stored Apple session that Apple no longer accepts.
+///
+/// The tokens kept for an account do expire, and once they do every call fails
+/// with developer API error 1100 until the account is signed in again. Nothing
+/// here can repair that -- the password is not stored -- so the account is out
+/// of action for this run.
+fn is_session_expired_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+
+    message.contains("session has expired")
+        || message.contains("please log in")
+        || message.contains("error 1100")
+}
+
+/// Why an Apple ID could not be used, when that is something another ID can fix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccountProblem {
+    /// At its weekly device or App ID cap.
+    Full,
+    /// Signed-in session no longer valid; needs the password again.
+    SessionExpired,
+}
+
+impl AccountProblem {
+    fn detect(message: &str) -> Option<Self> {
+        if is_account_full_error(message) {
+            Some(Self::Full)
+        } else if is_session_expired_error(message) {
+            Some(Self::SessionExpired)
+        } else {
+            None
+        }
+    }
+}
+
+/// Drops the `[URL: ...]` tail the developer API errors carry.
+///
+/// It is the same eighty characters on every failure and pushes the part that
+/// matters off the end of the dialog.
+fn tidy_error(message: &str) -> String {
+    match message.find(" [URL:") {
+        Some(cut) => message[..cut].trim_end().to_string(),
+        None => message.to_string(),
+    }
+}
+
 pub(crate) async fn run_install_batch(
     package: &plume_utils::Package,
     targets: &[Option<Device>],
@@ -320,10 +366,14 @@ pub(crate) async fn run_install_batch(
     tx: &std::sync::mpsc::Sender<(String, i32)>,
 ) -> Result<(), String> {
     let total = targets.len().max(1);
-    let mut failures: Vec<String> = Vec::new();
+    // (device name, tidied error) so identical failures can be grouped later.
+    let mut failures: Vec<(String, String)> = Vec::new();
     let mut installed = 0usize;
 
     let auto_select = store.auto_select_account();
+    // Accounts that turned out to need a fresh sign-in, reported once at the end
+    // rather than repeated per device.
+    let mut needs_sign_in: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for (index, target) in targets.iter().enumerate() {
         let udid = target.as_ref().map(|device| device.udid.as_str());
@@ -393,24 +443,36 @@ pub(crate) async fn run_install_batch(
                 break Ok(());
             };
 
-            // A full Apple ID is not a real failure while auto-select is on:
-            // there may be another one with room, so try it instead of giving up
-            // on this device. With auto-select off the user picked the account
-            // deliberately and swapping it behind their back would be wrong.
-            let switchable = auto_select && account.is_some() && is_account_full_error(&e);
+            // An Apple ID that is full, or whose session has gone stale, is not
+            // a failure of this device: another ID may well work, so try one
+            // instead of giving up here. With auto-select off the user picked
+            // the account deliberately and swapping it behind their back would
+            // be wrong.
+            let problem = if auto_select && account.is_some() {
+                AccountProblem::detect(&e)
+            } else {
+                None
+            };
 
-            if !switchable {
+            let Some(problem) = problem else {
                 break Err(e);
-            }
+            };
 
             let email = account
                 .as_ref()
                 .map(|account| account.email().clone())
                 .unwrap_or_default();
 
-            log::warn!("Apple ID {email} is full for {name}: {e}");
+            log::warn!("Apple ID {email} unusable for {name}: {e}");
 
-            let message = format!("{email} is full, trying another Apple ID...");
+            let message = match problem {
+                AccountProblem::Full => format!("{email} is full, trying another Apple ID..."),
+                AccountProblem::SessionExpired => {
+                    needs_sign_in.insert(email.clone());
+                    format!("{email} needs signing in again, trying another Apple ID...")
+                }
+            };
+
             let _ = tx.send((
                 match &label {
                     Some(label) => format!("{label} - {message}"),
@@ -426,21 +488,44 @@ pub(crate) async fn run_install_batch(
             Ok(()) => installed += 1,
             Err(e) => {
                 log::error!("Install failed for {name}: {e}");
-                failures.push(format!("{name}: {e}"));
+                failures.push((name.clone(), tidy_error(&e)));
             }
         }
     }
 
     if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} of {} succeeded. {}",
-            installed,
-            total,
-            failures.join(" | ")
-        ))
+        return Ok(());
     }
+
+    // Devices commonly share a name and fail for the same reason, so listing
+    // every one repeats the same sentence until the useful part is off screen.
+    // Group by message and count instead.
+    let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+    for (name, message) in failures {
+        match grouped.iter_mut().find(|(seen, _)| *seen == message) {
+            Some((_, names)) => names.push(name),
+            None => grouped.push((message, vec![name])),
+        }
+    }
+
+    let mut lines = vec![format!("{installed} of {total} succeeded.")];
+
+    for (message, names) in grouped {
+        if names.len() == 1 {
+            lines.push(format!("{}: {message}", names[0]));
+        } else {
+            lines.push(format!("{} devices: {message}", names.len()));
+        }
+    }
+
+    if !needs_sign_in.is_empty() {
+        lines.push(format!(
+            "Sign in again in Settings: {}",
+            needs_sign_in.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    Err(lines.join("\n"))
 }
 
 pub(crate) async fn run_installation(

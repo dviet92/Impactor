@@ -23,6 +23,7 @@ impl std::fmt::Display for Team {
 #[derive(Debug, Clone)]
 pub enum Message {
     ShowLogin,
+    ShowBulkAdd,
     SelectAccount(usize),
     RemoveAccount(usize),
     ExportP12,
@@ -296,20 +297,32 @@ impl SettingsScreen {
     }
 
     fn view_account_buttons(&self, selected_index: Option<usize>) -> Element<'_, Message> {
-        let mut buttons = row![
+        // Two rows rather than one: four buttons of translated text do not fit
+        // across a 575px window in every language.
+        let add_row = row![
             button(appearance::icon_text(
                 appearance::PLUS,
                 t!("settings_add_account"),
                 None
             ))
             .on_press(Message::ShowLogin)
+            .style(appearance::s_button),
+            button(appearance::icon_text(
+                appearance::FILE,
+                t!("settings_add_accounts_from_list"),
+                None
+            ))
+            .on_press(Message::ShowBulkAdd)
             .style(appearance::s_button)
         ]
-        .spacing(appearance::THEME_PADDING);
+        .spacing(appearance::THEME_PADDING)
+        .align_y(Alignment::Center);
+
+        let mut rows = column![add_row].spacing(appearance::THEME_PADDING);
 
         if let Some(index) = selected_index {
-            buttons = buttons
-                .push(
+            rows = rows.push(
+                row![
                     button(appearance::icon_text(
                         appearance::MINUS,
                         t!("settings_remove_account"),
@@ -317,8 +330,6 @@ impl SettingsScreen {
                     ))
                     .on_press(Message::RemoveAccount(index))
                     .style(appearance::s_button),
-                )
-                .push(
                     button(appearance::icon_text(
                         appearance::SHARE,
                         t!("settings_export_p12"),
@@ -326,9 +337,12 @@ impl SettingsScreen {
                     ))
                     .on_press(Message::ExportP12)
                     .style(appearance::s_button),
-                );
+                ]
+                .spacing(appearance::THEME_PADDING)
+                .align_y(Alignment::Center),
+            );
         }
 
-        buttons.align_y(Alignment::Center).into()
+        rows.into()
     }
 }

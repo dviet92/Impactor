@@ -39,10 +39,35 @@ pub struct LoginWindow {
     two_factor_is_sms: bool,
     trusted_phones: Vec<(u32, String)>,
     two_factor_tx: Option<std_mpsc::Sender<Result<TwoFactorAction, String>>>,
+    /// Position in a bulk add run, as (index, total). Only used for the header,
+    /// so the user can tell which account of the list is being asked about.
+    queue_position: Option<(usize, usize)>,
 }
 
 impl LoginWindow {
     pub fn new() -> (Self, Task<Message>) {
+        Self::open(String::new(), String::new(), None, false)
+    }
+
+    /// Opens the window already filled in and signs in straight away.
+    ///
+    /// Used by bulk add, which drives one account at a time through the same
+    /// window so that two-factor prompts keep working exactly as they do for a
+    /// single sign-in.
+    pub fn new_for_queue(
+        email: String,
+        password: String,
+        position: (usize, usize),
+    ) -> (Self, Task<Message>) {
+        Self::open(email, password, Some(position), true)
+    }
+
+    fn open(
+        email: String,
+        password: String,
+        queue_position: Option<(usize, usize)>,
+        submit_now: bool,
+    ) -> (Self, Task<Message>) {
         let (id, task) = window::open(window::Settings {
             size: iced::Size::new(400.0, 360.0),
             position: window::Position::Centered,
@@ -51,11 +76,17 @@ impl LoginWindow {
             ..Default::default()
         });
 
+        let open_task = if submit_now {
+            Task::batch(vec![task.discard(), Task::done(Message::LoginSubmit)])
+        } else {
+            task.discard()
+        };
+
         (
             Self {
                 window_id: Some(id),
-                email: String::new(),
-                password: String::new(),
+                email,
+                password,
                 two_factor_code: String::new(),
                 login_error: None,
                 two_factor_error: None,
@@ -64,8 +95,29 @@ impl LoginWindow {
                 two_factor_is_sms: false,
                 trusted_phones: Vec::new(),
                 two_factor_tx: None,
+                queue_position,
             },
-            task.discard(),
+            open_task,
+        )
+    }
+
+    /// Header shown above both the sign-in and the code prompt during a bulk run.
+    fn queue_header(&self) -> Option<Element<'_, Message>> {
+        let (index, total) = self.queue_position?;
+
+        Some(
+            column![
+                text(t!(
+                    "login_bulk_progress",
+                    index = index.to_string(),
+                    total = total.to_string(),
+                    email = self.email.as_str()
+                ))
+                .size(14),
+                text(t!("login_bulk_cancel_hint")).size(12),
+            ]
+            .spacing(4)
+            .into(),
         )
     }
 
@@ -84,8 +136,16 @@ impl LoginWindow {
                 Task::none()
             }
             Message::LoginSubmit => {
+                // A sign-in is already running. Without this, a second Enter or
+                // a stray submit would start another one and, worse, blank the
+                // password below -- which then looks like the window is asking
+                // for a password that was already filled in.
+                if self.is_logging_in {
+                    return Task::none();
+                }
+
                 if self.email.trim().is_empty() || self.password.is_empty() {
-                    self.login_error = Some("Email and password required".to_string());
+                    self.login_error = Some(t!("login_credentials_required").to_string());
                     return Task::none();
                 }
 
@@ -94,8 +154,10 @@ impl LoginWindow {
                 self.login_error = None;
                 self.two_factor_error = None;
                 let email = self.email.trim().to_string();
+                // Kept rather than cleared: a failed attempt should be one click
+                // from a retry instead of forcing the password to be typed again,
+                // and during a bulk run there is nobody to retype it.
                 let password = self.password.clone();
-                self.password.clear();
 
                 let (tx, rx) = std_mpsc::channel::<Result<TwoFactorAction, String>>();
                 self.two_factor_tx = Some(tx);
@@ -157,9 +219,13 @@ impl LoginWindow {
                 Task::none()
             }
             Message::TwoFactorSubmit => {
+                if self.is_logging_in {
+                    return Task::none();
+                }
+
                 let code = self.two_factor_code.trim().to_string();
                 if code.is_empty() {
-                    self.two_factor_error = Some("Code required".to_string());
+                    self.two_factor_error = Some(t!("login_code_required").to_string());
                     return Task::none();
                 }
 
@@ -213,15 +279,19 @@ impl LoginWindow {
             password_input = password_input.on_submit(Message::LoginSubmit);
         }
 
-        let mut content = column![
-            text(t!("login_only_set_to_fruit")).size(14),
-            text(t!("login_email")).size(14),
-            email_input,
-            text(t!("login_password")).size(14),
-            password_input,
-        ]
-        .spacing(appearance::THEME_PADDING)
-        .align_x(Alignment::Start);
+        let mut content = column![].spacing(appearance::THEME_PADDING);
+
+        if let Some(header) = self.queue_header() {
+            content = content.push(header);
+        }
+
+        content = content
+            .push(text(t!("login_only_set_to_fruit")).size(14))
+            .push(text(t!("login_email")).size(14))
+            .push(email_input)
+            .push(text(t!("login_password")).size(14))
+            .push(password_input)
+            .align_x(Alignment::Start);
 
         if let Some(error) = &self.login_error {
             content = content.push(text(error).style(|_theme| text::Style {
@@ -269,14 +339,18 @@ impl LoginWindow {
             t!("login_two_fa_desc")
         };
 
-        let mut content = column![
-            text(t!("login_two_fa")).size(20),
-            text(description).size(14),
-            code_input,
-        ]
-        .spacing(appearance::THEME_PADDING)
-        .padding(appearance::THEME_PADDING)
-        .align_x(Alignment::Start);
+        let mut content = column![].spacing(appearance::THEME_PADDING);
+
+        if let Some(header) = self.queue_header() {
+            content = content.push(header);
+        }
+
+        content = content
+            .push(text(t!("login_two_fa")).size(20))
+            .push(text(description).size(14))
+            .push(code_input)
+            .padding(appearance::THEME_PADDING)
+            .align_x(Alignment::Start);
 
         if let Some(error) = &self.two_factor_error {
             content = content.push(text(error).style(|_theme| text::Style {

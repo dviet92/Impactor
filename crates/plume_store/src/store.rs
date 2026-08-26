@@ -150,17 +150,31 @@ impl AccountStore {
     }
 
     pub async fn accounts_add(&mut self, account: GsaAccount) -> Result<(), Error> {
-        let email = account.email().clone();
-        self.accounts.insert(email.clone(), account);
+        let email = self.insert_account(account);
         self.selected_account = Some(email);
         self.save().await
     }
 
     pub fn accounts_add_sync(&mut self, account: GsaAccount) -> Result<(), Error> {
-        let email = account.email().clone();
-        self.accounts.insert(email.clone(), account);
+        let email = self.insert_account(account);
         self.selected_account = Some(email);
         self.save_sync()
+    }
+
+    /// Inserts an account, keeping the date it was *first* added.
+    ///
+    /// Signing in again on an existing email refreshes its tokens; it does not
+    /// make the account new. Without this, re-logging in would push an old
+    /// account to the front of the "most recently added" order.
+    fn insert_account(&mut self, mut account: GsaAccount) -> String {
+        let email = account.email().clone();
+
+        if let Some(first_added) = self.accounts.get(&email).and_then(GsaAccount::added_at) {
+            account.set_added_at(Some(first_added));
+        }
+
+        self.accounts.insert(email.clone(), account);
+        email
     }
 
     pub async fn accounts_remove(&mut self, email: &str) -> Result<(), Error> {
@@ -445,26 +459,41 @@ impl AccountStore {
         }
 
         // 2. Spread the load across the accounts that still have room.
-        let mut candidates: Vec<(&str, &GsaAccount, usize)> = self
+        struct Candidate<'a> {
+            email: &'a str,
+            account: &'a GsaAccount,
+            used: usize,
+            added_at: Option<DateTime<Utc>>,
+        }
+
+        let mut candidates: Vec<Candidate<'_>> = self
             .accounts
             .iter()
             .filter(|(email, _)| !refused.contains(*email))
-            .map(|(email, account)| {
-                (
-                    email.as_str(),
-                    account,
-                    self.devices_installed_since(email, cutoff),
-                )
+            .map(|(email, account)| Candidate {
+                email: email.as_str(),
+                account,
+                used: self.devices_installed_since(email, cutoff),
+                added_at: account.added_at(),
             })
-            .filter(|(_, _, used)| *used < AUTO_ACCOUNT_MAX_DEVICES)
+            .filter(|candidate| candidate.used < AUTO_ACCOUNT_MAX_DEVICES)
             .collect();
 
-        // Least loaded first, then by email so the pick does not depend on the
-        // hash map's iteration order.
-        candidates.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(b.0)));
+        // Least loaded first. Between accounts carrying the same number of
+        // devices, prefer the one added most recently: a fresh account has the
+        // most life left in it, while older ones are more likely to be near a
+        // limit we cannot see from here. `None` sorts below every `Some`, so
+        // accounts stored before add dates existed count as the oldest. Email is
+        // the last resort so the pick never depends on hash map order.
+        candidates.sort_by(|a, b| {
+            a.used
+                .cmp(&b.used)
+                .then_with(|| b.added_at.cmp(&a.added_at))
+                .then_with(|| a.email.cmp(b.email))
+        });
 
-        if let Some((_, account, _)) = candidates.first() {
-            return Some(account);
+        if let Some(candidate) = candidates.first() {
+            return Some(candidate.account);
         }
 
         // 3. Everything is full or unknown: use whatever is ticked.
