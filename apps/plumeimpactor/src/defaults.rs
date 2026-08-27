@@ -57,6 +57,56 @@ fn load_window_icon() -> window::Icon {
     window::icon::from_rgba(image.into_raw(), width, height).unwrap()
 }
 
+/// Anisette state directory for one Apple ID.
+///
+/// Every sign-in carries a device fingerprint built from the `state.plist` in
+/// this directory: `X-Mme-Device-Id` is a UUID over the random
+/// `keychain_identifier` stored there, `X-Apple-I-MD-LU` is a hash of the same
+/// bytes, and `X-Apple-I-MD-M` comes from the ADI provisioning kept alongside
+/// it. One shared directory made every account look like the same machine to
+/// Apple, which is what ties them together. One directory per account gives
+/// each its own fingerprint.
+pub fn get_anisette_path(email: &str) -> PathBuf {
+    // Lower cased so the same account reached through different capitalisation
+    // does not end up with two identities.
+    let email = email.trim().to_ascii_lowercase();
+
+    // A readable stem, plus a hash because the stem alone can collide once the
+    // characters a path cannot hold have been replaced.
+    let stem: String = email
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '.' | '-' => c,
+            _ => '_',
+        })
+        .take(40)
+        .collect();
+
+    let dir = get_data_path()
+        .join("anisette")
+        .join(format!("{stem}-{:016x}", fnv1a(&email)));
+
+    fs::create_dir_all(&dir).ok();
+
+    dir
+}
+
+/// FNV-1a, written out rather than pulled in.
+///
+/// This value becomes part of a directory name that has to resolve to the same
+/// account on every build and platform, for as long as the install lives.
+/// `DefaultHasher` guarantees neither.
+fn fnv1a(value: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    hash
+}
+
 pub fn get_data_path() -> PathBuf {
     let base = if cfg!(windows) {
         env::var("APPDATA").unwrap()

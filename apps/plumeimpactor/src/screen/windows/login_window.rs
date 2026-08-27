@@ -419,8 +419,10 @@ impl LoginWindow {
                         .build()
                         .unwrap();
 
+                    // Per account, so each Apple ID presents its own device
+                    // fingerprint to Apple instead of sharing one.
                     let anisette_config = AnisetteConfiguration::default()
-                        .set_configuration_path(crate::defaults::get_data_path());
+                        .set_configuration_path(crate::defaults::get_anisette_path(&email_clone));
 
                     let account_result = rt.block_on(Account::login(
                         || Ok((email_clone.clone(), password.clone())),
