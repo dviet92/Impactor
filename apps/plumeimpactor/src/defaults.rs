@@ -57,54 +57,33 @@ fn load_window_icon() -> window::Icon {
     window::icon::from_rgba(image.into_raw(), width, height).unwrap()
 }
 
-/// Anisette state directory for one Apple ID.
+/// The anisette state directory for an identity group, or the machine-wide one.
 ///
 /// Every sign-in carries a device fingerprint built from the `state.plist` in
 /// this directory: `X-Mme-Device-Id` is a UUID over the random
-/// `keychain_identifier` stored there, `X-Apple-I-MD-LU` is a hash of the same
-/// bytes, and `X-Apple-I-MD-M` comes from the ADI provisioning kept alongside
-/// it. One shared directory made every account look like the same machine to
-/// Apple, which is what ties them together. One directory per account gives
-/// each its own fingerprint.
-pub fn get_anisette_path(email: &str) -> PathBuf {
-    // Lower cased so the same account reached through different capitalisation
-    // does not end up with two identities.
-    let email = email.trim().to_ascii_lowercase();
-
-    // A readable stem, plus a hash because the stem alone can collide once the
-    // characters a path cannot hold have been replaced.
-    let stem: String = email
-        .chars()
-        .map(|c| match c {
-            'a'..='z' | '0'..='9' | '.' | '-' => c,
-            _ => '_',
-        })
-        .take(40)
-        .collect();
-
-    let dir = get_data_path()
-        .join("anisette")
-        .join(format!("{stem}-{:016x}", fnv1a(&email)));
-
-    fs::create_dir_all(&dir).ok();
-
-    dir
-}
-
-/// FNV-1a, written out rather than pulled in.
+/// `keychain_identifier` stored in it, `X-Apple-I-MD-LU` is a hash of the same
+/// bytes, and `X-Apple-I-MD-M` comes from the ADI provisioning kept alongside.
 ///
-/// This value becomes part of a directory name that has to resolve to the same
-/// account on every build and platform, for as long as the install lives.
-/// `DefaultHasher` guarantees neither.
-fn fnv1a(value: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-
-    for byte in value.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// `None` is the machine identity, kept directly in the data directory as it
+/// always has been, so accounts signed in before grouping existed keep
+/// working. `Some(n)` is `anisette/group-n/`: a separate fingerprint shared by
+/// up to the "max Apple IDs per identity" setting's worth of Apple IDs. A directory with no
+/// `state.plist` yet is provisioned by omnisette on first use, which is the
+/// slow, failure-prone step -- hence groups rather than one identity per
+/// account. Which one an account uses is recorded on the account itself
+/// ([`plume_store::GsaAccount::identity_group`]) and must not change after
+/// sign-in, because Apple binds the issued tokens to the fingerprint.
+pub fn get_anisette_path(group: Option<u32>) -> PathBuf {
+    match group {
+        None => get_data_path(),
+        Some(group) => {
+            let dir = get_data_path()
+                .join("anisette")
+                .join(format!("group-{group}"));
+            fs::create_dir_all(&dir).ok();
+            dir
+        }
     }
-
-    hash
 }
 
 pub fn get_data_path() -> PathBuf {

@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use crate::Error;
 use base64::{Engine, engine::general_purpose};
@@ -20,12 +21,25 @@ impl Account {
         let status_code = res.status();
 
         if !status_code.is_success() {
+            // Log what came back: an HTML page here says whether it is the same
+            // edge refusal as sign-in or a different rejection.
+            let snippet: String = res
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(300)
+                .collect();
+            log::error!(
+                "[gsa 2FA push] HTTP {status_code}; body starts: {snippet:?}"
+            );
             return Err(Error::AuthSrpWithMessage(
                 status_code.as_u16() as i64,
                 "Failed to send 2FA to devices".to_string(),
             ));
         }
 
+        log::info!("[gsa 2FA push] HTTP {status_code}, code requested on trusted devices");
         return Ok(LoginState::Needs2FAVerification);
     }
 
@@ -84,23 +98,86 @@ impl Account {
     }
 
     pub async fn verify_2fa(&self, code: String) -> Result<LoginState, Error> {
-        let headers = self.build_2fa_headers(false);
-        let res = self
-            .client
-            .get("https://gsa.apple.com/grandslam/GsService2/validate")
-            .headers(headers.await)
-            .header(
-                HeaderName::from_str("security-code").unwrap(),
-                HeaderValue::from_str(&code).unwrap(),
-            )
-            .send()
-            .await?;
+        // Apple answers a valid request with a plist. When it is rate limiting
+        // -- which happens easily after signing several accounts from one
+        // machine -- or is having a transient hiccup, it answers with an HTML
+        // error page or a 5xx instead. That used to be parsed as a plist and
+        // surfaced as `invalid type: string "<html>", expected a map`, an error
+        // that looks fatal but is not: the trusted-device code stays valid for
+        // a few minutes and allows several attempts, so waiting and retrying
+        // the same code usually gets through.
+        const ATTEMPTS: u32 = 4;
+        const BACKOFF: Duration = Duration::from_secs(2);
+        // A 429 here is the same sign-in rate limit as at SRP init; two seconds
+        // later only adds to the count. The trusted-device code stays valid for
+        // a few minutes, so a longer wait costs nothing but patience.
+        // The user's 429 wait, but never more than 20s per step here: the
+        // code they typed is only good for a few minutes.
+        let rate_limit_backoff = crate::net::rate_limit_wait().min(Duration::from_secs(20));
 
-        let res: plist::Dictionary = plist::from_bytes(res.text().await?.as_bytes())?;
+        let mut last_transient: Option<String> = None;
+        let mut next_wait = BACKOFF;
 
-        super::check_error(&res)?;
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(next_wait * attempt).await;
+            }
 
-        Ok(LoginState::NeedsLogin)
+            let headers = self.build_2fa_headers(false).await;
+            let res = self
+                .client
+                .get("https://gsa.apple.com/grandslam/GsService2/validate")
+                .headers(headers)
+                .header(
+                    HeaderName::from_str("security-code").unwrap(),
+                    HeaderValue::from_str(&code).unwrap(),
+                )
+                .send()
+                .await?;
+
+            let status = res.status();
+            let body = res.text().await?;
+
+            match plist::from_bytes::<plist::Dictionary>(body.as_bytes()) {
+                Ok(dict) => {
+                    // A parsed plist carrying a non-zero error code is a real
+                    // answer (a wrong or expired code), not a transient one, so
+                    // it is returned rather than retried.
+                    super::check_error(&dict)?;
+                    return Ok(LoginState::NeedsLogin);
+                }
+                Err(parse_err) => {
+                    let transient = status.is_server_error()
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                        || body.trim_start().starts_with('<');
+
+                    if !transient {
+                        return Err(Error::Plist(parse_err));
+                    }
+
+                    next_wait = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        rate_limit_backoff
+                    } else {
+                        BACKOFF
+                    };
+                    log::warn!(
+                        "2FA validation got a non-plist response (HTTP {status}); \
+                         attempt {}/{ATTEMPTS}, retrying in {}s",
+                        attempt + 1,
+                        (next_wait * (attempt + 1)).as_secs()
+                    );
+                    last_transient = Some(format!("HTTP {status}"));
+                }
+            }
+        }
+
+        Err(Error::AuthSrpWithMessage(
+            -1,
+            format!(
+                "Apple's verification service is busy ({}). Wait a moment and enter the code again.",
+                last_transient.as_deref().unwrap_or("temporary error")
+            ),
+        ))
     }
 
     pub async fn verify_sms_2fa(

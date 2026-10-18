@@ -44,6 +44,21 @@ pub struct LoginWindow {
     queue_position: Option<(usize, usize)>,
 }
 
+/// `ab…@domain` -- enough to tell accounts apart in a log, not enough to
+/// identify one.
+pub(crate) fn redact_email(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            let keep: String = local.chars().take(2).collect();
+            format!("{keep}…@{domain}")
+        }
+        None => {
+            let keep: String = email.chars().take(2).collect();
+            format!("{keep}…")
+        }
+    }
+}
+
 impl LoginWindow {
     pub fn new() -> (Self, Task<Message>) {
         Self::open(String::new(), String::new(), None, false)
@@ -402,6 +417,32 @@ impl LoginWindow {
         container(content).padding(20).into()
     }
 
+    /// Asks the stored settings which identity a sign-in for `email` should
+    /// use. A store that cannot be read falls back to the machine identity,
+    /// which is what every account used before grouping existed.
+    fn identity_group_for(rt: &tokio::runtime::Runtime, email: &str) -> Option<u32> {
+        let path = crate::defaults::get_data_path().join("accounts.json");
+
+        match rt.block_on(AccountStore::load(&Some(path))) {
+            Ok(store) => store.identity_group_for_sign_in(email),
+            Err(err) => {
+                log::warn!("[login] could not read account store ({err}); using machine identity");
+                None
+            }
+        }
+    }
+
+    /// Pulls a readable message out of whatever a panic carried.
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown cause".to_string());
+
+        format!("Sign-in failed unexpectedly: {detail}")
+    }
+
     fn perform_login(
         email: String,
         password: String,
@@ -413,16 +454,28 @@ impl LoginWindow {
                 let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
                 let email_clone = email.clone();
 
-                std::thread::spawn(move || {
+                let worker = std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .unwrap();
 
-                    // Per account, so each Apple ID presents its own device
-                    // fingerprint to Apple instead of sharing one.
+                    // Which device identity to sign in under. Decided here,
+                    // before the request, and written onto the account after:
+                    // Apple binds the tokens to the fingerprint that asked, so
+                    // signing later with a different one gets them rejected.
+                    let identity_group = Self::identity_group_for(&rt, &email_clone);
+                    log::info!(
+                        "[login] identity for {}: {}",
+                        redact_email(&email_clone),
+                        match identity_group {
+                            Some(group) => format!("group {group}"),
+                            None => "machine".to_string(),
+                        }
+                    );
+
                     let anisette_config = AnisetteConfiguration::default()
-                        .set_configuration_path(crate::defaults::get_anisette_path(&email_clone));
+                        .set_configuration_path(crate::defaults::get_anisette_path(identity_group));
 
                     let account_result = rt.block_on(Account::login(
                         || Ok((email_clone.clone(), password.clone())),
@@ -449,7 +502,10 @@ impl LoginWindow {
                                 email_clone.clone(),
                                 account,
                             )) {
-                                Ok(gsa) => Message::LoginSuccess(gsa),
+                                Ok(mut gsa) => {
+                                    gsa.set_identity_group(identity_group);
+                                    Message::LoginSuccess(gsa)
+                                }
                                 Err(e) => Message::LoginFailed(e.to_string()),
                             }
                         }
@@ -458,8 +514,26 @@ impl LoginWindow {
                     let _ = bridge_tx.send(final_msg);
                 });
 
+                let mut reported = false;
                 while let Some(msg) = bridge_rx.recv().await {
+                    reported = matches!(
+                        msg,
+                        Message::LoginSuccess(_) | Message::LoginFailed(_)
+                    );
                     let _ = output.send(msg).await;
+                }
+
+                // The channel closed without an outcome, which means the worker
+                // died rather than finished -- a panic somewhere below. Say so.
+                // Staying silent leaves the window on "signing in" forever, with
+                // no error and no way back except closing it.
+                if !reported {
+                    let reason = match worker.join() {
+                        Err(payload) => Self::panic_message(payload),
+                        Ok(()) => "the sign-in task stopped without reporting a result".to_string(),
+                    };
+
+                    let _ = output.send(Message::LoginFailed(reason)).await;
                 }
             },
         )

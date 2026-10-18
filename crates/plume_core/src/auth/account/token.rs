@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use aes::cipher::consts::U16;
 use aes_gcm::AesGcm;
 use aes_gcm::aes::Aes256;
@@ -11,11 +13,74 @@ use sha2::Sha256;
 
 use crate::auth::account::{check_error, parse_response};
 use crate::auth::{
-    Account, AppToken, AuthTokenRequest, AuthTokenRequestBody, GSA_ENDPOINT, RequestHeader,
+    Account, AppToken, AuthTokenRequest, AuthTokenRequestBody, GSA_ENDPOINT, GSA_USER_AGENT,
+    RequestHeader,
 };
 
 impl Account {
+    /// Fetches an app token, retrying when Apple answers with a busy page.
+    ///
+    /// Runs the same GSA endpoint as sign-in, so it hits the same rate limiting;
+    /// only [`Error::AppleBusy`] is retried, real errors are returned at once.
     pub async fn get_app_token(&self, app_name: &str) -> Result<AppToken, Error> {
+        // One retry only -- see `login_email_pass_retrying` for why hammering a
+        // refusing edge is counterproductive.
+        const ATTEMPTS: u32 = 2;
+        const BACKOFF: Duration = Duration::from_secs(5);
+
+        let mut last_busy: Option<String> = None;
+
+        // A 429 gets a real wait instead of the quick busy backoff; see
+        // `login_email_pass_retrying` for why five seconds is not a retry.
+        const RATE_LIMIT_WAIT_CAP: Duration = Duration::from_secs(300);
+        let rate_limit_wait = crate::net::rate_limit_wait();
+
+        let mut next_wait = BACKOFF;
+
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(next_wait).await;
+            }
+
+            match self.get_app_token_once(app_name).await {
+                Err(Error::AppleBusy(detail)) => {
+                    log::warn!(
+                        "GSA token refused ({detail}); attempt {}/{ATTEMPTS}",
+                        attempt + 1
+                    );
+                    last_busy = Some(detail);
+                    next_wait = BACKOFF;
+                }
+                Err(Error::RateLimited {
+                    detail,
+                    retry_after,
+                }) => {
+                    next_wait = retry_after
+                        .unwrap_or(Duration::ZERO)
+                        .max(rate_limit_wait)
+                        .min(RATE_LIMIT_WAIT_CAP);
+                    log::warn!(
+                        "GSA token rate limited ({detail}); attempt {}/{ATTEMPTS}, next in {}s",
+                        attempt + 1,
+                        next_wait.as_secs()
+                    );
+                    last_busy = Some(detail);
+                }
+                other => return other,
+            }
+        }
+
+        Err(Error::AuthSrpWithMessage(
+            -1,
+            format!(
+                "Apple refused the token request ({}). Try again from a different \
+                 network, or wait several hours.",
+                last_busy.as_deref().unwrap_or("HTTP 503")
+            ),
+        ))
+    }
+
+    async fn get_app_token_once(&self, app_name: &str) -> Result<AppToken, Error> {
         let spd = self.spd.as_ref().unwrap();
         let dsid = spd.get("adsid").unwrap().as_string().unwrap();
         let auth_token = spd.get("GsIdmsToken").unwrap().as_string().unwrap();
@@ -35,7 +100,7 @@ impl Account {
         gsa_headers.insert("Accept", HeaderValue::from_str("*/*").unwrap());
         gsa_headers.insert(
             "User-Agent",
-            HeaderValue::from_str("akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0").unwrap(),
+            HeaderValue::from_str(GSA_USER_AGENT).unwrap(),
         );
         gsa_headers.insert(
             "X-MMe-Client-Info",
@@ -71,7 +136,7 @@ impl Account {
             .body(buffer)
             .send()
             .await;
-        let res = parse_response(res).await?;
+        let res = parse_response("apptokens", res).await?;
         let err_check = check_error(&res);
         if err_check.is_err() {
             return Err(err_check.err().unwrap());

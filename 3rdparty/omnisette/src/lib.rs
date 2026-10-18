@@ -31,6 +31,14 @@ pub enum AnisetteError {
     InvalidArgument(String),
     #[error("Anisette not provisioned!")]
     AnisetteNotProvisioned,
+    #[error("Anisette provisioning failed: {0}")]
+    ProvisioningFailed(String),
+    /// The anisette server gave up waiting mid-exchange. Its own doing, not the
+    /// account's or the identity's, and it clears on a retry -- kept apart from
+    /// `ProvisioningFailed` so callers can back off and try again instead of
+    /// reporting a failure to the user.
+    #[error("the anisette server timed out while creating this device identity")]
+    ProvisioningTimeout,
     #[error("Plist serialization error {0}")]
     PlistError(#[from] plist::Error),
     #[error("Request Error {0}")]
@@ -53,6 +61,32 @@ pub enum AnisetteError {
     MissingLibraries,
     #[error("{0}")]
     Anyhow(#[from] anyhow::Error),
+}
+
+/// Proxy for the requests this crate makes to Apple during provisioning.
+///
+/// Set by the application (through `plume_core::net::configure`) so that
+/// provisioning leaves from the same address as the sign-in that follows it.
+static PROXY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn set_proxy(url: Option<String>) {
+    if let Ok(mut guard) = PROXY.write() {
+        *guard = url;
+    }
+}
+
+pub fn proxy() -> Option<String> {
+    PROXY.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Routes a client builder through the configured proxy, if any.
+pub(crate) fn apply_proxy(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::ClientBuilder, reqwest::Error> {
+    match proxy() {
+        Some(url) => Ok(builder.proxy(reqwest::Proxy::all(url)?)),
+        None => Ok(builder),
+    }
 }
 
 pub const DEFAULT_ANISETTE_URL: &str = "https://ani.f1sh.me/";

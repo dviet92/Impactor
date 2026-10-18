@@ -8,9 +8,21 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::auth::anisette_data::AnisetteData;
-use crate::{Error, client};
+use crate::{Error, gsa_client};
 
 const GSA_ENDPOINT: &str = "https://gsa.apple.com/grandslam/GsService2";
+
+/// User-Agent for GrandSlam sign-in and token requests.
+///
+/// This is the string AltStore's own fix (AltStore PR #1790, September 2026)
+/// was verified against, so it is kept verbatim. It was briefly replaced with an
+/// AuthKit/Xcode agent on the theory that Apple's late-August edge tightening
+/// (two requests per keep-alive connection, then HTML 503) singled this one
+/// out; the real trigger turned out to be the `com.apple.dt.Xcode` token, which
+/// that replacement agent carried too -- see `GSA_CLIENT_APP` in
+/// `anisette_data.rs`. The connection limit is moot here because
+/// `crate::gsa_client` opens a fresh connection for every request.
+pub(crate) const GSA_USER_AGENT: &str = "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0";
 
 #[derive(Debug, Clone)]
 pub struct Account {
@@ -26,7 +38,9 @@ impl Account {
     }
 
     pub fn new_with_anisette(anisette: AnisetteData) -> Result<Self, Error> {
-        let client = client()?;
+        // Fresh connection per request; see `gsa_client` for why a pooled one
+        // now fails sign-in outright.
+        let client = gsa_client()?;
         Ok(Account {
             anisette: Arc::new(Mutex::new(anisette)),
             spd: None,

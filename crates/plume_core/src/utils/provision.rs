@@ -17,7 +17,7 @@ pub struct MobileProvision {
 impl MobileProvision {
     pub fn load_with_path<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let path = path.as_ref();
-        let data = fs::read(path)?;
+        let data = fs::read(path).map_err(Error::io_at(path))?;
 
         Self::load_with_bytes(data)
     }

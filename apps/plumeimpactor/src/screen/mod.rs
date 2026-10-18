@@ -61,6 +61,9 @@ pub enum Message {
     },
     UpdateTrayMenu,
 
+    // Keyboard shortcuts that no widget consumed, with the window they came from
+    HotKey(HotKey, window::Id),
+
     // Window management
     RelaunchRequested,
     ShowWindow,
@@ -86,6 +89,9 @@ pub enum Message {
     // Multi install
     MultiInstallToggleDevice(String),
     MultiInstallSetAll(bool),
+    /// Tick exactly the devices the last run did not finish: the ones that
+    /// failed, and the ones never installed at all.
+    MultiInstallSelectUnfinished,
     MultiInstallConfirm,
     MultiInstallCancel,
 
@@ -98,13 +104,56 @@ pub enum Message {
     BulkAddOpen(BulkCredential, usize, usize),
 }
 
-/// How long to wait between sign-ins during a bulk run.
+/// Fallback pause between sign-ins during a bulk run, when the store has none.
 ///
 /// Signing several Apple IDs in from one machine back to back looks like abuse
 /// to Apple: the sessions get invalidated and the accounts can be locked, which
 /// then needs a manual unlock on appleid.apple.com. Spacing the attempts out
-/// costs a couple of minutes and avoids that.
-const BULK_LOGIN_GAP: std::time::Duration = std::time::Duration::from_secs(30);
+/// costs a couple of minutes and avoids that. The value actually used is the
+/// user's, from the Connection tab: with a proxy pool in front there is no
+/// shared counter to respect and it can be zero.
+const BULK_LOGIN_GAP: std::time::Duration =
+    std::time::Duration::from_secs(plume_store::DEFAULT_BULK_GAP_SECS);
+
+/// The gap stops growing here after repeated rate limits.
+const BULK_LOGIN_GAP_MAX: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// After a 429 the gap at least becomes this, so a gap of zero (proxy users)
+/// still backs off instead of doubling zero forever.
+const BULK_LOGIN_GAP_AFTER_429_MIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Keys handled at the application level when no widget took them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotKey {
+    /// Remove the ticked account, on the Settings > Accounts page.
+    Delete,
+    /// Move focus to the next text field -- the login window's email box to
+    /// its password box.
+    Tab,
+    ShiftTab,
+}
+
+/// Orders devices by OS version, then UDID.
+///
+/// The version is compared as numbers, not text: as text "9.3" sorts after
+/// "18.5", and the same breaks for any component that reaches double digits.
+/// Devices whose version could not be read sort last rather than first, so a
+/// failed lockdown query does not push one to the top of the list. UDID breaks
+/// ties and is what makes the order survive a replug.
+fn device_sort_key(device: &Device) -> (bool, Vec<u32>, &str) {
+    let version = device.os_version.as_deref();
+
+    let numbers = version
+        .map(|version| {
+            version
+                .split('.')
+                .map(|part| part.trim().parse::<u32>().unwrap_or(0))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (version.is_none(), numbers, device.udid.as_str())
+}
 
 /// One line of the pasted account list.
 #[derive(Clone)]
@@ -184,11 +233,32 @@ struct BulkAddPrompt {
 #[derive(Debug, Default)]
 struct BulkAddQueue {
     pending: VecDeque<BulkCredential>,
+    /// How many accounts were queued, for the "3 of 7" header.
+    total: usize,
     current: Option<String>,
+    /// The credential being signed in, kept so a rate-limited attempt can be
+    /// put back on the queue instead of being written off.
+    current_credential: Option<BulkCredential>,
+    /// Accounts already given a second go after a rate limit. One retry each:
+    /// a second 429 in a row means the wait is still too short, and the
+    /// summary should say so rather than loop.
+    requeued: std::collections::HashSet<String>,
+    /// Current pause between sign-ins. Starts at the user's setting and
+    /// doubles each time Apple answers 429, since that is Apple saying the
+    /// gap was not long enough.
+    gap: std::time::Duration,
     added: Vec<String>,
     failed: Vec<String>,
-    skipped: Vec<String>,
     cancelled: bool,
+}
+
+impl BulkAddQueue {
+    /// Whether a sign-in failure was Apple's sign-in rate limit rather than
+    /// anything about the account. Matched on the message plume_core builds
+    /// for [`plume_core::Error::RateLimited`].
+    fn is_rate_limit(error: &str) -> bool {
+        error.contains("HTTP 429") || error.contains("rate limit")
+    }
 }
 
 impl BulkAddQueue {
@@ -197,16 +267,9 @@ impl BulkAddQueue {
         let mut lines = vec![rust_i18n::t!(
             "bulk_add_summary_counts",
             added = self.added.len().to_string(),
-            skipped = self.skipped.len().to_string(),
             failed = self.failed.len().to_string()
         )
         .to_string()];
-
-        if !self.skipped.is_empty() {
-            lines.push(String::new());
-            lines.push(rust_i18n::t!("bulk_add_summary_skipped").to_string());
-            lines.extend(self.skipped.iter().map(|email| format!("  {email}")));
-        }
 
         if !self.failed.is_empty() {
             lines.push(String::new());
@@ -251,7 +314,6 @@ pub struct Impactor {
     login_windows: std::collections::HashMap<window::Id, login_window::LoginWindow>,
     pending_installation: bool,
     certificate_reset_queue: VecDeque<crate::certificate_reset::ConfirmationRequest>,
-    selected_locale: Option<String>,
     /// Installer screen kept alive while an install runs, so leaving the progress
     /// screen returns to the loaded package instead of the empty drop zone.
     parked_installer: Option<package::PackageScreen>,
@@ -284,10 +346,9 @@ impl Impactor {
         let mut tray = ImpactorTray::new();
         let store = Self::init_account_store_sync();
         tray.update_refresh_apps(&store);
-        let selected_locale = store.locale().map(str::to_string);
-        if let Some(code) = &selected_locale {
-            rust_i18n::set_locale(code);
-        }
+        // Everything Apple-facing reads these globals; install the saved
+        // choice before any window can start a sign-in.
+        Self::apply_network(store.network());
         let start_in_tray = crate::startup::start_in_tray_from_args();
         let (main_window, open_task) = if start_in_tray {
             (None, Task::none())
@@ -310,7 +371,6 @@ impl Impactor {
                 login_windows: std::collections::HashMap::new(),
                 pending_installation: false,
                 certificate_reset_queue: VecDeque::new(),
-                selected_locale,
                 parked_installer: None,
                 install_in_flight: false,
                 multi_install: None,
@@ -366,6 +426,13 @@ impl Impactor {
             Message::DeviceConnected(device) => {
                 if !self.devices.iter().any(|d| d.device_id == device.device_id) {
                     self.devices.push(device.clone());
+
+                    // Keep one stable order everywhere devices are listed. They
+                    // arrive in whatever order they are detected, so unplugging
+                    // and replugging one otherwise shuffles the multi-install
+                    // list and the picker under the user.
+                    self.devices
+                        .sort_by(|a, b| device_sort_key(a).cmp(&device_sort_key(b)));
 
                     if self.selected_device.is_none() && device.device_id != u32::MAX {
                         self.selected_device = Some(device.clone());
@@ -580,6 +647,26 @@ impl Impactor {
                 self.tray.take();
                 std::process::exit(0);
             }
+            Message::HotKey(hotkey, id) => match hotkey {
+                HotKey::Delete => {
+                    // Main window, Settings, Accounts page -- anywhere else
+                    // Delete means nothing.
+                    let on_accounts_page = matches!(
+                        &self.current_screen,
+                        ImpactorScreen::Settings(screen) if screen.tab() == settings::Tab::Accounts
+                    );
+                    if Some(id) == self.main_window && on_accounts_page {
+                        Task::done(Message::SettingsScreen(settings::Message::RemoveSelected))
+                    } else {
+                        Task::none()
+                    }
+                }
+                // Focus operations run across every open window; the main
+                // window has nothing focusable on most screens, so in practice
+                // this walks the login window's email -> password fields.
+                HotKey::Tab => iced::widget::operation::focus_next(),
+                HotKey::ShiftTab => iced::widget::operation::focus_previous(),
+            },
             Message::LoginWindowMessage(id, msg) => {
                 if let Some(login_window) = self.login_windows.get_mut(&id) {
                     let task = login_window.update(msg.clone());
@@ -593,6 +680,7 @@ impl Impactor {
                                 let email = account.email().clone();
                                 if let Some(queue) = &mut self.bulk_queue {
                                     queue.current = None;
+                                    queue.current_credential = None;
                                     queue.added.push(email);
                                 }
                                 true
@@ -600,8 +688,29 @@ impl Impactor {
                             login_window::Message::LoginFailed(error) => {
                                 let error = error.clone();
                                 if let Some(queue) = &mut self.bulk_queue {
+                                    let credential = queue.current_credential.take();
                                     if let Some(email) = queue.current.take() {
-                                        queue.failed.push(format!("{email}: {error}"));
+                                        // A 429 is not this account failing, it
+                                        // is the list going too fast. Slow down
+                                        // and give the account one more turn at
+                                        // the end, once the others have gone.
+                                        let retry = BulkAddQueue::is_rate_limit(&error)
+                                            && !queue.requeued.contains(&email);
+                                        match (retry, credential) {
+                                            (true, Some(credential)) => {
+                                                queue.gap = (queue.gap * 2)
+                                                    .max(BULK_LOGIN_GAP_AFTER_429_MIN)
+                                                    .min(BULK_LOGIN_GAP_MAX);
+                                                log::warn!(
+                                                    "bulk add: rate limited on {}; gap now {}s, account re-queued",
+                                                    login_window::redact_email(&email),
+                                                    queue.gap.as_secs()
+                                                );
+                                                queue.requeued.insert(email);
+                                                queue.pending.push_back(credential);
+                                            }
+                                            _ => queue.failed.push(format!("{email}: {error}")),
+                                        }
                                     }
                                 }
                                 true
@@ -733,6 +842,26 @@ impl Impactor {
                             }
                             Task::none()
                         }
+                        settings::Message::ToggleAccountFullMark(index) => {
+                            // Marked accounts read as full to auto-pick for a
+                            // week, which is what makes it reach past an Apple
+                            // ID that signs but whose apps will not open.
+                            if let Some(store) = &mut self.account_store {
+                                let mut emails: Vec<_> = store.accounts().keys().cloned().collect();
+                                emails.sort();
+                                if let Some(email) = emails.get(index) {
+                                    let result = if store.account_is_marked_full(email) {
+                                        store.clear_account_full_mark_sync(email)
+                                    } else {
+                                        store.mark_account_full_sync(email)
+                                    };
+                                    if let Err(err) = result {
+                                        log::error!("Failed to save the full mark: {err}");
+                                    }
+                                }
+                            }
+                            Task::none()
+                        }
                         settings::Message::ExportP12 => {
                             if let Some(account) = self
                                 .account_store
@@ -817,19 +946,147 @@ impl Impactor {
                             }
                             Task::none()
                         }
-                        settings::Message::SelectLocale(choice) => {
-                            self.selected_locale = choice.clone();
-                            let effective = choice
-                                .clone()
-                                .or_else(|| current_locale::current_locale().ok())
-                                .unwrap_or_else(|| "en".to_string());
-                            rust_i18n::set_locale(&effective);
+                        settings::Message::ToggleGroupIdentities(enabled) => {
                             if let Some(store) = &mut self.account_store {
-                                if let Err(err) = store.set_locale_sync(choice) {
-                                    log::error!("Failed to persist locale: {err}");
+                                if let Err(err) = store.set_group_identities_sync(enabled) {
+                                    log::error!(
+                                        "Failed to persist identity grouping setting: {err}"
+                                    );
                                 }
                             }
                             Task::none()
+                        }
+                        settings::Message::RemoveSelected => {
+                            if let Some(store) = &mut self.account_store {
+                                if let Some(email) =
+                                    store.selected_account().map(|account| account.email().clone())
+                                {
+                                    if let Err(err) = store.accounts_remove_sync(&email) {
+                                        log::error!("Failed to remove account: {err}");
+                                    }
+                                }
+                            }
+                            Task::none()
+                        }
+                        settings::Message::ProxyApply => {
+                            // Validate again here rather than trusting the
+                            // screen's live check: this is the point where the
+                            // value is written to disk and handed to every
+                            // client.
+                            let draft = screen.proxy_draft().map(str::to_string);
+                            let valid = match &draft {
+                                Some(url) => plume_core::net::validate_proxy(url).is_ok(),
+                                None => true,
+                            };
+                            if valid {
+                                if let Some(store) = &mut self.account_store {
+                                    let mut network = store.network().clone();
+                                    network.proxy_url = draft;
+                                    if let Err(err) = store.set_network_sync(network) {
+                                        log::error!("Failed to persist proxy: {err}");
+                                    }
+                                    Self::apply_network(store.network());
+                                }
+                                screen.update(msg).map(Message::SettingsScreen)
+                            } else {
+                                Task::none()
+                            }
+                        }
+                        settings::Message::ProxyClear => {
+                            if let Some(store) = &mut self.account_store {
+                                let mut network = store.network().clone();
+                                network.proxy_url = None;
+                                if let Err(err) = store.set_network_sync(network) {
+                                    log::error!("Failed to persist proxy: {err}");
+                                }
+                                Self::apply_network(store.network());
+                            }
+                            screen.update(msg).map(Message::SettingsScreen)
+                        }
+                        settings::Message::ProxyTest => {
+                            // reqwest needs a tokio reactor, which iced's
+                            // executor is not, so the probe runs on its own
+                            // thread and reports back through a oneshot.
+                            let (tx, rx) =
+                                iced::futures::channel::oneshot::channel::<Result<String, String>>();
+                            std::thread::spawn(move || {
+                                let result = match tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                {
+                                    Ok(rt) => rt.block_on(plume_core::net::test_connection()),
+                                    Err(e) => Err(format!("could not start runtime: {e}")),
+                                };
+                                let _ = tx.send(result);
+                            });
+                            let started = screen.update(msg).map(Message::SettingsScreen);
+                            Task::batch(vec![
+                                started,
+                                Task::perform(
+                                    async move {
+                                        rx.await.unwrap_or_else(|_| {
+                                            Err("the test stopped without a result".to_string())
+                                        })
+                                    },
+                                    |result| {
+                                        Message::SettingsScreen(settings::Message::ProxyTested(
+                                            result,
+                                        ))
+                                    },
+                                ),
+                            ])
+                        }
+                        settings::Message::BulkGapEdited(ref text) => {
+                            // Saved on every valid keystroke; an unparsable
+                            // draft (an emptied box) just stays on screen.
+                            if let Ok(seconds) = text.trim().parse::<u64>() {
+                                if let Some(store) = &mut self.account_store {
+                                    let mut network = store.network().clone();
+                                    network.bulk_gap_secs = seconds;
+                                    if let Err(err) = store.set_network_sync(network) {
+                                        log::error!("Failed to persist bulk gap: {err}");
+                                    }
+                                }
+                            }
+                            screen.update(msg).map(Message::SettingsScreen)
+                        }
+                        settings::Message::IdentityGroupSizeEdited(ref text) => {
+                            // Saved on every valid keystroke, like the other
+                            // number boxes; an emptied box just stays empty
+                            // until something parseable is typed.
+                            if let Ok(size) = text.trim().parse::<u64>() {
+                                if let Some(store) = &mut self.account_store {
+                                    if let Err(err) = store.set_identity_group_size_sync(size) {
+                                        log::error!("Failed to persist identity group size: {err}");
+                                    }
+                                }
+                            }
+                            screen.update(msg).map(Message::SettingsScreen)
+                        }
+                        settings::Message::InstallParallelEdited(ref text) => {
+                            if let Ok(devices) = text.trim().parse::<u64>() {
+                                if let Some(store) = &mut self.account_store {
+                                    let mut network = store.network().clone();
+                                    network.install_parallel = devices;
+                                    if let Err(err) = store.set_network_sync(network) {
+                                        log::error!("Failed to persist install parallelism: {err}");
+                                    }
+                                }
+                            }
+                            screen.update(msg).map(Message::SettingsScreen)
+                        }
+                        settings::Message::RateLimitWaitEdited(ref text) => {
+                            if let Ok(seconds) = text.trim().parse::<u64>() {
+                                if let Some(store) = &mut self.account_store {
+                                    let mut network = store.network().clone();
+                                    network.rate_limit_wait_secs = seconds;
+                                    if let Err(err) = store.set_network_sync(network) {
+                                        log::error!("Failed to persist rate-limit wait: {err}");
+                                    }
+                                    Self::apply_network(store.network());
+                                }
+                            }
+                            screen.update(msg).map(Message::SettingsScreen)
                         }
                         _ => screen.update(msg).map(Message::SettingsScreen),
                     }
@@ -886,11 +1143,25 @@ impl Impactor {
                         progress::Message::Back => Task::done(Message::PreviousScreen),
                         progress::Message::InstallationFinished => {
                             self.install_in_flight = false;
+                            self.reload_install_status();
                             Task::done(Message::UpdateTrayMenu)
                         }
                         _ => {
+                            // A terminal failure comes through here as progress
+                            // -1 (or an explicit error), unlike success which
+                            // arrives as its own InstallationFinished message.
+                            // Note it before `msg` is consumed so the colours in
+                            // the picker are refreshed when the batch failed too.
+                            let terminal = matches!(
+                                &msg,
+                                progress::Message::InstallationProgress(_, -1)
+                                    | progress::Message::InstallationError(_)
+                            );
                             let task = screen.update(msg).map(Message::ProgressScreen);
                             self.install_in_flight = screen.is_installing;
+                            if terminal {
+                                self.reload_install_status();
+                            }
                             task
                         }
                     }
@@ -1048,6 +1319,27 @@ impl Impactor {
                 }
                 Task::none()
             }
+            Message::MultiInstallSelectUnfinished => {
+                if let Some(prompt) = &mut self.multi_install {
+                    // Replaces the selection rather than adding to it: the point
+                    // of the button is "give me the ones still to do", so a
+                    // device that already succeeded is dropped even if it was
+                    // ticked by hand. Anything that is not a recorded success --
+                    // failed, never installed, or a result old enough to have
+                    // aged out -- counts as still to do.
+                    let store = self.account_store.as_ref();
+                    prompt.selected = self
+                        .devices
+                        .iter()
+                        .filter(|device| {
+                            store.and_then(|store| store.device_install_ok(&device.udid))
+                                != Some(true)
+                        })
+                        .map(|device| device.udid.clone())
+                        .collect();
+                }
+                Task::none()
+            }
             Message::MultiInstallCancel => {
                 self.multi_install = None;
                 Task::none()
@@ -1088,30 +1380,20 @@ impl Impactor {
                     return Task::none();
                 }
 
-                // Accounts already signed in are left alone rather than being
-                // signed in again, which would cost a round trip per account and
-                // reset nothing useful.
-                let existing: std::collections::HashSet<String> = self
+                // Every account on the list is signed in, including ones that
+                // are already stored. A repeat sign-in overwrites the stored
+                // entry with fresh tokens and today's added date, which is how
+                // a list is used to mark a batch of accounts as "new" again so
+                // auto-pick reaches for them first. (Existing accounts used to
+                // be skipped here.)
+                let mut queue = BulkAddQueue::default();
+                queue.total = credentials.len();
+                queue.gap = self
                     .account_store
                     .as_ref()
-                    .map(|store| {
-                        store
-                            .accounts()
-                            .keys()
-                            .map(|email| email.to_ascii_lowercase())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let mut queue = BulkAddQueue::default();
-
-                for credential in credentials {
-                    if existing.contains(&credential.email.to_ascii_lowercase()) {
-                        queue.skipped.push(credential.email);
-                    } else {
-                        queue.pending.push_back(credential);
-                    }
-                }
+                    .map(|store| std::time::Duration::from_secs(store.network().bulk_gap_secs))
+                    .unwrap_or(BULK_LOGIN_GAP);
+                queue.pending.extend(credentials);
 
                 queue.failed.extend(
                     malformed
@@ -1158,12 +1440,16 @@ impl Impactor {
                     return Task::none();
                 };
 
-                // Count only the accounts actually being signed in. `total`
-                // includes the ones skipped as already present, so subtracting
-                // from it would start the count part way through the list.
-                let attempted = queue.added.len() + queue.failed.len() + 1;
-                let to_attempt = attempted + queue.pending.len();
+                // Position in the run: everything popped so far, this one
+                // included. Not `failed.len()`, which also counts malformed
+                // lines that were never queued and would start the header part
+                // way through the list.
+                // A re-queued account makes the list one longer than it was.
+                let to_attempt = queue.total + queue.requeued.len();
+                let attempted = to_attempt - queue.pending.len();
                 queue.current = Some(credential.email.clone());
+                queue.current_credential = Some(credential.clone());
+                let gap = queue.gap;
 
                 let open = Message::BulkAddOpen(credential, attempted, to_attempt);
 
@@ -1178,7 +1464,7 @@ impl Impactor {
 
                 let (ready_tx, ready_rx) = iced::futures::channel::oneshot::channel::<()>();
                 std::thread::spawn(move || {
-                    std::thread::sleep(BULK_LOGIN_GAP);
+                    std::thread::sleep(gap);
                     let _ = ready_tx.send(());
                 });
 
@@ -1287,6 +1573,27 @@ impl Impactor {
             None
         });
 
+        // Only keys that reached the application unclaimed: a Delete typed
+        // into the proxy box is consumed by the text input first and never
+        // arrives here, so it cannot remove an account.
+        let hotkey_subscription = iced::event::listen_with(|event, status, id| {
+            use iced::keyboard::{Event as KeyEvent, Key, key::Named};
+
+            if status != iced::event::Status::Ignored {
+                return None;
+            }
+            let iced::Event::Keyboard(KeyEvent::KeyPressed { key, modifiers, .. }) = event else {
+                return None;
+            };
+            let hotkey = match key {
+                Key::Named(Named::Delete) => HotKey::Delete,
+                Key::Named(Named::Tab) if modifiers.shift() => HotKey::ShiftTab,
+                Key::Named(Named::Tab) => HotKey::Tab,
+                _ => return None,
+            };
+            Some(Message::HotKey(hotkey, id))
+        });
+
         Subscription::batch(vec![
             device_subscription,
             tray_subscription,
@@ -1296,6 +1603,7 @@ impl Impactor {
             certificate_reset_subscription,
             relaunch_subscription,
             close_subscription,
+            hotkey_subscription,
         ])
     }
 
@@ -1336,11 +1644,7 @@ impl Impactor {
             ImpactorScreen::Main(screen) => screen.view().map(Message::MainScreen),
             ImpactorScreen::Utilities(screen) => screen.view().map(Message::UtilitiesScreen),
             ImpactorScreen::Settings(screen) => screen
-                .view(
-                    &self.account_store,
-                    &self.selected_locale,
-                    self.selected_device.as_ref(),
-                )
+                .view(&self.account_store)
                 .map(Message::SettingsScreen),
             ImpactorScreen::Installer(screen) => {
                 screen.view(has_device).map(Message::InstallerScreen)
@@ -1401,7 +1705,13 @@ impl Impactor {
                 text(rust_i18n::t!("bulk_add_waiting")).size(appearance::THEME_FONT_SIZE + 2.0),
                 text(rust_i18n::t!(
                     "bulk_add_waiting_why",
-                    seconds = BULK_LOGIN_GAP.as_secs().to_string()
+                    seconds = self
+                        .bulk_queue
+                        .as_ref()
+                        .map(|queue| queue.gap)
+                        .unwrap_or(BULK_LOGIN_GAP)
+                        .as_secs()
+                        .to_string()
                 ))
                 .size(appearance::THEME_FONT_SIZE - 2.0),
             ]
@@ -1512,28 +1822,106 @@ impl Impactor {
             .as_ref()
             .is_some_and(|store| store.auto_select_account());
 
+        // Which account each ticked device would actually get, assigned in the
+        // order the run will install them -- so the picker shows the real spread
+        // (newest account fills three devices, then the next) rather than the
+        // same top pick under every row.
+        let projected_accounts: std::collections::HashMap<String, String> = if show_accounts {
+            let selected_in_order: Vec<String> = self
+                .devices
+                .iter()
+                .filter(|device| prompt.selected.contains(&device.udid))
+                .map(|device| device.udid.clone())
+                .collect();
+
+            self.account_store
+                .as_ref()
+                .map(|store| store.project_device_accounts(&selected_in_order))
+                .unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        const OK_COLOR: iced::Color = iced::Color {
+            r: 0.16,
+            g: 0.65,
+            b: 0.27,
+            a: 1.0,
+        };
+        const FAIL_COLOR: iced::Color = iced::Color {
+            r: 0.85,
+            g: 0.25,
+            b: 0.25,
+            a: 1.0,
+        };
+
+        // How a device's last install went: `Some(true)` done, `Some(false)`
+        // failed, `None` never installed (or the record aged out). Read from the
+        // store, which was written to disk as the run went, so this survives the
+        // app being reopened or crashing mid-run.
+        let install_ok = |udid: &str| -> Option<bool> {
+            self.account_store
+                .as_ref()
+                .and_then(|store| store.device_install_ok(udid))
+        };
+
+        let status_color = |udid: &str| -> Option<iced::Color> {
+            install_ok(udid).map(|ok| if ok { OK_COLOR } else { FAIL_COLOR })
+        };
+
+        // Why the last attempt failed, when one did and a reason was saved.
+        // Shown whether or not the device is ticked: the point of it is to be
+        // readable before deciding what to retry.
+        let install_error = |udid: &str| -> Option<String> {
+            self.account_store
+                .as_ref()
+                .and_then(|store| store.device_install_error(udid))
+                .map(str::to_string)
+        };
+
         let entries = self.devices.iter().fold(
             column![].spacing(appearance::THEME_PADDING),
             |list, device| {
                 let udid = device.udid.clone();
                 let checked = prompt.selected.contains(&udid);
+                let color = status_color(&device.udid);
 
-                let mut entry = column![
-                    checkbox(checked)
-                        .label(device.to_string())
-                        .on_toggle(move |_| Message::MultiInstallToggleDevice(udid.clone()))
-                ]
-                .spacing(2);
+                let mut check = checkbox(checked)
+                    .label(device.to_string())
+                    .on_toggle(move |_| Message::MultiInstallToggleDevice(udid.clone()));
 
-                if show_accounts {
-                    let account = self
-                        .account_store
-                        .as_ref()
-                        .and_then(|store| store.account_for_device(Some(device.udid.as_str())))
-                        .map(|account| account.email().clone())
-                        .unwrap_or_else(|| rust_i18n::t!("multi_install_no_account").to_string());
+                // Colour the device name by its last install result, keeping the
+                // rest of the checkbox exactly as the theme draws it.
+                if let Some(color) = color {
+                    check = check.style(move |theme, status| {
+                        let mut style = iced::widget::checkbox::primary(theme, status);
+                        style.text_color = Some(color);
+                        style
+                    });
+                }
+
+                let mut entry = column![check].spacing(2);
+
+                // Only a ticked device gets an account line, and it shows the
+                // account this device will actually be signed with once the run
+                // assigns them in order -- not the same top pick for all.
+                if show_accounts && checked {
+                    let account = projected_accounts.get(&device.udid).cloned().unwrap_or_else(
+                        || rust_i18n::t!("multi_install_no_account").to_string(),
+                    );
 
                     entry = entry.push(text(account).size(appearance::THEME_FONT_SIZE - 2.0));
+                }
+
+                // The saved reason for a red row, so the run does not have to be
+                // repeated to find out what went wrong -- and so it is still
+                // there after the app is closed and reopened.
+                if let Some(reason) = install_error(&device.udid) {
+                    entry = entry.push(
+                        text(rust_i18n::t!("multi_install_last_error", reason = reason).to_string())
+                            .size(appearance::THEME_FONT_SIZE - 2.0)
+                            .color(FAIL_COLOR),
+                    );
                 }
 
                 list.push(entry)
@@ -1553,10 +1941,36 @@ impl Impactor {
             rust_i18n::t!("multi_install_all")
         };
 
-        let actions = row![
+        // Everything that is not a recorded success: the red rows and the ones
+        // with no colour at all. Disabled when there are none, which is itself
+        // the answer to "is anything left to do?".
+        let unfinished = self
+            .devices
+            .iter()
+            .filter(|device| install_ok(&device.udid) != Some(true))
+            .count();
+
+        // Two rows rather than one: four buttons of text do not fit across the
+        // dialog, and picking what to install is a separate step from starting.
+        let select_actions = row![
             button(text(toggle_all_label))
                 .on_press(Message::MultiInstallSetAll(!all_selected))
                 .style(appearance::s_button),
+            button(text(
+                rust_i18n::t!(
+                    "multi_install_select_unfinished",
+                    count = unfinished.to_string()
+                )
+                .to_string()
+            ))
+            .on_press_maybe((unfinished > 0).then_some(Message::MultiInstallSelectUnfinished))
+            .style(appearance::s_button),
+            container(text("")).width(Fill),
+        ]
+        .spacing(appearance::THEME_PADDING)
+        .align_y(iced::Alignment::Center);
+
+        let actions = row![
             container(text("")).width(Fill),
             button(text(rust_i18n::t!("back")))
                 .on_press(Message::MultiInstallCancel)
@@ -1580,6 +1994,7 @@ impl Impactor {
             column![
                 text(rust_i18n::t!("multi_install")).size(appearance::THEME_FONT_SIZE + 2.0),
                 body,
+                select_actions,
                 actions,
             ]
             .spacing(appearance::THEME_PADDING),
@@ -1716,6 +2131,24 @@ impl Impactor {
         self.start_install_batch(vec![target])
     }
 
+    /// Hands the saved proxy and 429 wait to every Apple-facing client.
+    fn apply_network(network: &plume_store::NetworkSettings) {
+        plume_core::net::configure(plume_core::net::Settings {
+            proxy: network.proxy_url.clone(),
+            rate_limit_wait: std::time::Duration::from_secs(network.rate_limit_wait_secs),
+        });
+    }
+
+    /// Reloads the account store from disk once a run has ended.
+    ///
+    /// The batch writes each device's result straight to `accounts.json` as it
+    /// goes; the copy held in memory here does not see those writes, so it is
+    /// re-read now. That is what lets the multi-install picker show the fresh
+    /// green/red colours the next time it is opened.
+    fn reload_install_status(&mut self) {
+        self.account_store = Some(Self::init_account_store_sync());
+    }
+
     /// Runs the loaded package against each target in turn on a worker thread.
     ///
     /// A `None` target is the export path, which has no device at all. Every
@@ -1753,32 +2186,47 @@ impl Impactor {
         }
         self.install_in_flight = true;
 
+        // A panic anywhere in the install (a failed unwrap deep in signing, the
+        // device layer, or a dependency) unwinds out of the worker. Caught here
+        // it becomes a normal failure the progress screen can show, instead of a
+        // stuck bar -- and, because the profile now unwinds rather than aborts,
+        // it no longer takes the whole app down. crash.log still records it.
+        let tx_panic = tx.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
             let tx_error = tx.clone();
-            rt.block_on(async move {
-                // The staged copy is deliberately left in place. It is what lets the
-                // user go back and install the same package to another device, and it
-                // is cleaned up when they return to the drop zone.
-                match subscriptions::run_install_batch(
-                    &package, &targets, &options, &mut store, &tx,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        let message = if count > 1 {
-                            rust_i18n::t!("multi_install_done", count = count.to_string())
-                                .to_string()
-                        } else {
-                            "Installation complete!".to_string()
-                        };
-                        let _ = tx.send((message, 100));
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async move {
+                    // The staged copy is deliberately left in place. It is what lets the
+                    // user go back and install the same package to another device, and it
+                    // is cleaned up when they return to the drop zone.
+                    match subscriptions::run_install_batch(
+                        &package, &targets, &options, &mut store, &tx,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            let message = if count > 1 {
+                                rust_i18n::t!("multi_install_done", count = count.to_string())
+                                    .to_string()
+                            } else {
+                                "Installation complete!".to_string()
+                            };
+                            let _ = tx.send((message, 100));
+                        }
+                        Err(e) => {
+                            let _ = tx_error.send((format!("Error: {}", e), -1));
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx_error.send((format!("Error: {}", e), -1));
-                    }
-                }
-            });
+                });
+            }));
+
+            if ran.is_err() {
+                let _ = tx_panic.send((
+                    rust_i18n::t!("install_crashed").to_string(),
+                    -1,
+                ));
+            }
         });
 
         Task::none()

@@ -24,6 +24,27 @@ pub enum Message {
     OpenDonate,
 }
 
+/// Says why a package could not be opened.
+///
+/// Dropping the error on the floor made a rejected file look like a drop the
+/// window had ignored, which sent people looking at the app when the error
+/// already named the problem -- a file still syncing, or a disk with no room
+/// left to stage it.
+fn report_package_error(error: plume_utils::Error) {
+    let description = error.to_string();
+
+    log::warn!("Failed to open package: {description}");
+
+    // Off the UI thread: rfd's dialog blocks until it is dismissed.
+    std::thread::spawn(move || {
+        rfd::MessageDialog::new()
+            .set_title(&t!("package_open_failed").to_string())
+            .set_description(&description)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    });
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GeneralScreen;
 
@@ -49,19 +70,35 @@ impl GeneralScreen {
             }
             Message::FileSelected(path) => {
                 if let Some(path) = path {
-                    if let Ok(package) = Package::new(path) {
-                        return Task::done(Message::NavigateToInstaller(package));
+                    match Package::new(path) {
+                        Ok(package) => {
+                            return Task::done(Message::NavigateToInstaller(package));
+                        }
+                        Err(e) => report_package_error(e),
                     }
                 }
                 Task::none()
             }
             Message::FilesDropped(paths) => {
                 for path in paths {
-                    if let Some(ext) = path.extension() {
-                        if ext == "ipa" || ext == "tipa" {
-                            if let Ok(package) = Package::new(path) {
-                                return Task::done(Message::NavigateToInstaller(package));
-                            }
+                    let is_package = path
+                        .extension()
+                        .is_some_and(|ext| ext == "ipa" || ext == "tipa");
+
+                    if !is_package {
+                        continue;
+                    }
+
+                    match Package::new(path) {
+                        Ok(package) => {
+                            return Task::done(Message::NavigateToInstaller(package));
+                        }
+                        // Stop at the first package we tried. Falling through to
+                        // the next dropped file would leave the message that
+                        // explains the failure buried under a second one.
+                        Err(e) => {
+                            report_package_error(e);
+                            break;
                         }
                     }
                 }

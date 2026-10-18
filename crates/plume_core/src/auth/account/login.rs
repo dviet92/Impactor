@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use omnisette::AnisetteConfiguration;
 use plist::{Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -9,7 +11,8 @@ use crate::Error;
 use crate::auth::account::{check_error, parse_response};
 use crate::auth::anisette_data::AnisetteData;
 use crate::auth::{
-    Account, ChallengeRequest, ChallengeRequestBody, GSA_ENDPOINT, InitRequest, InitRequestBody,
+    Account, ChallengeRequest, ChallengeRequestBody, GSA_ENDPOINT, GSA_USER_AGENT, InitRequest,
+    InitRequestBody,
     LoginState, RequestHeader, TrustedPhoneNumber, TwoFactorAction, TwoFactorMethod,
     TwoFactorRequest,
 };
@@ -43,6 +46,18 @@ macro_rules! plist_get_string {
     }};
 }
 
+/// `dviet40@icloud.com` -> `dv***@icloud.com`, so a log can be shared without
+/// handing over the account name.
+fn redact_email(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            let shown: String = local.chars().take(2).collect();
+            format!("{shown}***@{domain}")
+        }
+        None => "***".to_string(),
+    }
+}
+
 impl Account {
     pub async fn login(
         appleid_closure: impl Fn() -> Result<(String, String), String>,
@@ -66,7 +81,7 @@ impl Account {
             Error::AuthSrpWithMessage(0, format!("Failed to get Apple ID credentials: {}", e))
         })?;
 
-        let mut response = _self.login_email_pass(&username, &password).await?;
+        let mut response = _self.login_email_pass_retrying(&username, &password).await?;
         // Cached so the caller can be offered an SMS fallback even when a trusted
         // device handled the push. Fetched lazily the first time 2FA is needed.
         let mut trusted_phone_numbers: Vec<TrustedPhoneNumber> = Vec::new();
@@ -74,6 +89,7 @@ impl Account {
         loop {
             match response {
                 LoginState::NeedsDevice2FA => {
+                    log::info!("[gsa] password accepted; asking Apple to push a 2FA code to trusted devices");
                     response = _self.send_2fa_to_devices().await?;
                     if trusted_phone_numbers.is_empty() {
                         if let Ok(extras) = _self.get_auth_extras().await {
@@ -82,6 +98,7 @@ impl Account {
                     }
                 }
                 LoginState::Needs2FAVerification => {
+                    log::info!("[gsa] 2FA push sent; waiting for the code to be entered");
                     let request = TwoFactorRequest {
                         method: TwoFactorMethod::Device,
                         trusted_phone_numbers: trusted_phone_numbers.clone(),
@@ -98,6 +115,7 @@ impl Account {
                     }
                 }
                 LoginState::NeedsSMS2FA => {
+                    log::info!("[gsa] Apple wants SMS 2FA");
                     if trusted_phone_numbers.is_empty() {
                         if let Ok(extras) = _self.get_auth_extras().await {
                             trusted_phone_numbers = extras.trusted_phone_numbers;
@@ -126,16 +144,115 @@ impl Account {
                     }
                 }
                 LoginState::NeedsLogin => {
-                    response = _self.login_email_pass(&username, &password).await?
+                    log::info!("[gsa] 2FA verified; signing in again to obtain the session");
+                    response = _self.login_email_pass_retrying(&username, &password).await?
                 }
-                LoginState::LoggedIn => return Ok(_self),
+                LoginState::LoggedIn => {
+                    log::info!("[gsa] signed in");
+                    return Ok(_self);
+                }
                 LoginState::NeedsExtraStep(step) => {
+                    log::warn!("[gsa] Apple asks for an extra step: {step}");
                     if _self.get_pet().is_some() {
                         return Ok(_self);
                     } else {
                         return Err(Error::ExtraStep(step));
                     }
                 }
+            }
+        }
+    }
+
+    /// Signs in, retrying when Apple answers with a busy page or a rate limit.
+    ///
+    /// The whole exchange is retried, not just the failed request: each attempt
+    /// recomputes a fresh SRP ephemeral and anisette, so there is no half-used
+    /// state to carry over. A real credential or protocol error is returned at
+    /// once. Two kinds of refusal are retried, differently:
+    ///
+    /// * [`Error::AppleBusy`] -- a 5xx or an HTML page on some other status.
+    ///   One quick retry only. Every request rides its own connection, so this
+    ///   is not the per-connection limit; it is Apple's edge refusing this IP or
+    ///   device identity, and hammering it only extends the block.
+    /// * [`Error::RateLimited`] -- HTTP 429. Apple counts sign-in requests per
+    ///   network and identity over a short window, and several Apple IDs signed
+    ///   in within a minute or two trip it. The account is fine and so is the
+    ///   identity; the request just came too soon. Wait a real interval (what
+    ///   `Retry-After` says, or a growing default) and try again, twice. Five
+    ///   seconds later is not a retry, it is another hit on the counter.
+    async fn login_email_pass_retrying(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<LoginState, Error> {
+        const BUSY_BACKOFF: Duration = Duration::from_secs(5);
+        /// Never sleep longer than this on Apple's say-so.
+        const RATE_LIMIT_WAIT_CAP: Duration = Duration::from_secs(300);
+
+        // Minimum waits before the second and third attempt after a 429. The
+        // base is the user's: someone routing through a proxy pool can set it
+        // near zero, since each attempt may leave from a different address.
+        let base = crate::net::rate_limit_wait();
+        let rate_limit_waits: [Duration; 2] = [base, base * 2];
+
+        let mut busy_retried = false;
+        let mut rate_limit_hits = 0usize;
+
+        loop {
+            match self.login_email_pass(username, password).await {
+                Err(Error::AppleBusy(detail)) => {
+                    if busy_retried {
+                        return Err(Error::AuthSrpWithMessage(
+                            -1,
+                            format!(
+                                "Apple is refusing sign-in from this network or device identity \
+                                 ({detail}). This is not a wrong password. Try from a different \
+                                 network (for example a phone hotspot), or wait several hours \
+                                 before trying again -- every retry extends the block."
+                            ),
+                        ));
+                    }
+                    log::warn!(
+                        "GSA login refused ({detail}); retrying once in {}s",
+                        BUSY_BACKOFF.as_secs()
+                    );
+                    busy_retried = true;
+                    tokio::time::sleep(BUSY_BACKOFF).await;
+                }
+                Err(Error::RateLimited {
+                    detail,
+                    retry_after,
+                }) => {
+                    let Some(minimum) = rate_limit_waits.get(rate_limit_hits) else {
+                        return Err(Error::AuthSrpWithMessage(
+                            -1,
+                            format!(
+                                "Apple is rate limiting sign-ins from this network ({detail}). \
+                                 This is not a wrong password and the account is not locked: \
+                                 too many Apple IDs signed in close together. Wait a few minutes \
+                                 before the next one."
+                            ),
+                        ));
+                    };
+                    rate_limit_hits += 1;
+
+                    let wait = retry_after
+                        .unwrap_or(Duration::ZERO)
+                        .max(*minimum)
+                        .min(RATE_LIMIT_WAIT_CAP);
+                    log::warn!(
+                        "GSA rate limited ({detail}); waiting {}s before attempt {} of {}{}",
+                        wait.as_secs(),
+                        rate_limit_hits + 1,
+                        rate_limit_waits.len() + 1,
+                        match retry_after {
+                            Some(hint) => format!(" (Apple asked for {}s)", hint.as_secs()),
+                            None => String::new(),
+                        }
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+                other => return other,
             }
         }
     }
@@ -160,11 +277,28 @@ impl Account {
         gsa_headers.insert("Accept", HeaderValue::from_str("*/*").unwrap());
         gsa_headers.insert(
             "User-Agent",
-            HeaderValue::from_str("akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0").unwrap(),
+            HeaderValue::from_str(GSA_USER_AGENT).unwrap(),
         );
         gsa_headers.insert(
             "X-MMe-Client-Info",
             HeaderValue::from_str(&anisette.get_header("x-mme-client-info")?).unwrap(),
+        );
+
+        // What this attempt presents to Apple. The user agent is the field Apple
+        // has been filtering on; the anisette machine token (X-Apple-I-MD-M)
+        // and device id show whether provisioning actually produced an identity
+        // -- a request without them is refused before credentials are checked.
+        // Values that identify the machine are logged by presence only.
+        log::info!(
+            "[gsa SRP init] user={} ua={:?} client-info={:?} anisette: md-m={} device-id={} md={}",
+            redact_email(&username_for_spd),
+            GSA_USER_AGENT,
+            anisette
+                .get_header("x-mme-client-info")
+                .unwrap_or_else(|_| "<missing>".to_string()),
+            anisette.get_header("x-apple-i-md-m").is_ok(),
+            anisette.get_header("x-mme-device-id").is_ok(),
+            anisette.get_header("x-apple-i-md").is_ok(),
         );
 
         let header = RequestHeader {
@@ -194,7 +328,7 @@ impl Account {
             .send()
             .await;
 
-        let res = parse_response(res).await?;
+        let res = parse_response("SRP init", res).await?;
         check_error(&res)?;
 
         let salt = res.get("s").unwrap().as_data().unwrap();
@@ -242,7 +376,7 @@ impl Account {
             .send()
             .await;
 
-        let res = parse_response(res).await?;
+        let res = parse_response("SRP complete", res).await?;
         check_error(&res)?;
 
         let m2 = res.get("M2").unwrap().as_data().unwrap();
@@ -287,9 +421,18 @@ impl Account {
 
     pub async fn get_anisette(&self) -> AnisetteData {
         let mut locked = self.anisette.lock().await;
+
         if locked.needs_refresh() {
-            *locked = locked.refresh().await.unwrap();
+            // A failed refresh used to panic, killing the login thread without
+            // reporting anything. Keep the headers we already have instead: they
+            // may still be inside their window, and if they are not, the request
+            // fails with an error the caller can show.
+            match locked.refresh().await {
+                Ok(refreshed) => *locked = refreshed,
+                Err(e) => log::warn!("Could not refresh anisette headers, reusing the current set: {e}"),
+            }
         }
+
         locked.clone()
     }
 }

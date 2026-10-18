@@ -45,7 +45,7 @@ impl CertificateIdentity {
 
         if let Some(paths) = paths {
             for path in &paths {
-                let pem_data = fs::read(path)?;
+                let pem_data = fs::read(path).map_err(Error::io_at(path))?;
                 cert.resolve_certificate_from_contents(pem_data)?;
             }
         }
@@ -82,7 +82,7 @@ impl CertificateIdentity {
         // Only the key will be written to disk, certificate can just be gotten via the request
         // request we've made, by trying to match our public key with the requests public key
         let key_pair: [Vec<u8>; 2] = if key_path.exists() {
-            let key_string = fs::read_to_string(&key_path)?;
+            let key_string = fs::read_to_string(&key_path).map_err(Error::io_at(&key_path))?;
             let priv_key = RsaPrivateKey::from_pkcs8_pem(&key_string)?;
 
             if let Some(certificate) = identity
@@ -123,7 +123,7 @@ impl CertificateIdentity {
                 .unwrap();
                 let key_pem = priv_key.to_pkcs8_pem(Default::default())?.to_string();
 
-                fs::write(&key_path, &key_pem)?;
+                fs::write(&key_path, &key_pem).map_err(Error::io_at(&key_path))?;
                 identity.new = true;
                 [cert_pem.into_bytes(), key_pem.into_bytes()]
             }
@@ -147,7 +147,7 @@ impl CertificateIdentity {
             .unwrap();
             let key_pem = priv_key.to_pkcs8_pem(Default::default())?.to_string();
 
-            fs::write(&key_path, &key_pem)?;
+            fs::write(&key_path, &key_pem).map_err(Error::io_at(&key_path))?;
             identity.new = true;
             [cert_pem.into_bytes(), key_pem.into_bytes()]
         };
@@ -168,7 +168,7 @@ impl CertificateIdentity {
     fn key_dir(path: PathBuf, team_id: &String) -> Result<PathBuf, Error> {
         let dir = path.join("keys").join(team_id);
 
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).map_err(Error::io_at(&dir))?;
 
         Ok(dir)
     }

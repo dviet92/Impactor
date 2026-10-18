@@ -122,8 +122,11 @@ pub trait ConfigurableADIProxy: ADIProxy {
 }
 
 pub const AKD_USER_AGENT: &str = "akd/1.0 CFNetwork/808.1.4";
+// `com.apple.akd`, not `com.apple.dt.Xcode`: since September 2026 Apple's edge
+// refuses any GrandSlam request whose client info names Xcode (upstream
+// Impactor f9b9769, SideStore/apple-private-apis#27).
 pub const CLIENT_INFO_HEADER: &str =
-    "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>";
+    "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
 pub const DS_ID: i64 = -2;
 pub const IDENTIFIER_LENGTH: usize = 16;
 pub type Identifier = [u8; IDENTIFIER_LENGTH];
@@ -184,12 +187,12 @@ impl dyn ADIProxy {
 
         debug!("Headers sent: {headers:?}");
 
-        let http_client = ClientBuilder::new()
+        let builder = ClientBuilder::new()
             .http1_title_case_headers()
             .danger_accept_invalid_certs(true) // TODO: pin the apple certificate
             .user_agent(AKD_USER_AGENT)
-            .default_headers(headers)
-            .build()?;
+            .default_headers(headers);
+        let http_client = crate::apply_proxy(builder)?.build()?;
 
         Ok(http_client)
     }

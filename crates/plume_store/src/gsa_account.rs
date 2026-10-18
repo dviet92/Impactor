@@ -15,6 +15,24 @@ pub struct GsaAccount {
     /// account that does carry a date, so "unknown" sorts as oldest.
     #[serde(default)]
     added_at: Option<DateTime<Utc>>,
+    /// Which shared device identity this account signed in with.
+    ///
+    /// `Some(n)` means the anisette state under `anisette/group-n/`; `None`
+    /// means the machine-wide identity. Fixed at sign-in, because the tokens
+    /// Apple issued are bound to the identity that asked for them: signing or
+    /// refreshing with a different one gets them rejected. Changing the
+    /// grouping setting therefore only affects later sign-ins.
+    #[serde(default)]
+    identity_group: Option<u32>,
+    /// When this account last signed a device.
+    ///
+    /// Stamped at signing time, the same moment the device is recorded against
+    /// the account, because that is when one of the account's three slots is
+    /// spent. Unlike the device entries, which are dropped after seven days,
+    /// this is kept for good: it is the only thing that tells an account that
+    /// was never used from one whose week simply ran out.
+    #[serde(default)]
+    last_install_at: Option<DateTime<Utc>>,
 }
 
 impl GsaAccount {
@@ -32,6 +50,8 @@ impl GsaAccount {
             xcode_gs_token,
             team_id,
             added_at: Some(Utc::now()),
+            identity_group: None,
+            last_install_at: None,
         }
     }
     pub fn email(&self) -> &String {
@@ -57,6 +77,18 @@ impl GsaAccount {
     }
     pub fn set_added_at(&mut self, added_at: Option<DateTime<Utc>>) {
         self.added_at = added_at;
+    }
+    pub fn identity_group(&self) -> Option<u32> {
+        self.identity_group
+    }
+    pub fn set_identity_group(&mut self, group: Option<u32>) {
+        self.identity_group = group;
+    }
+    pub fn last_install_at(&self) -> Option<DateTime<Utc>> {
+        self.last_install_at
+    }
+    pub fn set_last_install_at(&mut self, at: Option<DateTime<Utc>>) {
+        self.last_install_at = at;
     }
 }
 

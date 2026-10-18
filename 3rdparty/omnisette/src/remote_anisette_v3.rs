@@ -1,5 +1,6 @@
 // Implementing the SideStore Anisette v3 protocol
 
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, fs, io::Cursor, path::PathBuf};
 
 use async_trait::async_trait;
@@ -126,6 +127,10 @@ impl AnisetteState {
 pub struct AnisetteClient {
     client_info: AnisetteClientInfo,
     url: String,
+    /// Built once and reused. Each request still opens its own connection (see
+    /// `make_reqwest`); what is saved is rebuilding the TLS stack three times
+    /// in the middle of a session the server is timing.
+    http: Client,
 }
 
 #[derive(Serialize)]
@@ -176,24 +181,136 @@ impl AnisetteData {
     }
 }
 
+/// How long one request to Apple may take before it is given up on.
+///
+/// Provisioning runs inside a websocket session the anisette server times out
+/// on its own schedule, so a request that hangs does not just cost time -- it
+/// costs the whole session, and the next attempt starts from nothing. Failing
+/// fast and retrying beats waiting on a request the server has already stopped
+/// caring about.
+const APPLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const APPLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
 fn make_reqwest() -> Result<Client, AnisetteError> {
-    Ok(ClientBuilder::new()
+    let builder = ClientBuilder::new()
         .http1_title_case_headers()
         .danger_accept_invalid_certs(true) // TODO: pin the apple certificate
-        .build()?)
+        .connect_timeout(APPLE_CONNECT_TIMEOUT)
+        .timeout(APPLE_REQUEST_TIMEOUT)
+        // Apple's GrandSlam edge answers only two requests per connection and
+        // 503s the rest. Provisioning makes three, so each one gets a
+        // connection of its own -- which is what building a client per request
+        // used to do by accident, and what this keeps doing on purpose now that
+        // the client is built once and reused.
+        .pool_max_idle_per_host(0);
+    Ok(crate::apply_proxy(builder)?.build()?)
+}
+
+/// The client application Apple currently accepts in `X-Mme-Client-Info`.
+///
+/// Since September 2026 Apple's edge refuses any GrandSlam request whose client
+/// info names `com.apple.dt.Xcode`, answering with a generic HTML error page
+/// (HTTP 503, later 429) before reading the request. The public anisette
+/// servers still advertise the Xcode identity from `/v3/client_info`, and this
+/// provider used to replay it verbatim to Apple on every provisioning call --
+/// `lookup`, `midStartProvisioning`, `midFinishProvisioning` -- so provisioning
+/// a fresh identity failed even after the sign-in path had been fixed. The
+/// identity is corrected here, at the one place it enters, rather than trusting
+/// the server (AltStore PR #1796 does the same on device).
+const CLIENT_APP: &str = "com.apple.AuthKit/1 (com.apple.akd/1.0)";
+
+/// Rewrites the client-application segment of a `<model> <os> <app>`
+/// description to [`CLIENT_APP`]; an unexpected shape is passed through.
+fn accepted_client_info(advertised: &str) -> String {
+    match advertised
+        .split('<')
+        .nth(3)
+        .and_then(|segment| segment.split('>').next())
+    {
+        Some(app) if !app.is_empty() => advertised.replace(app, CLIENT_APP),
+        _ => advertised.to_string(),
+    }
+}
+
+/// Turns Apple's answer to a provisioning request into a plist dictionary,
+/// or into an error that says what Apple actually sent.
+///
+/// These used to be unwrapped: an HTML refusal from Apple's edge was then a
+/// plist parse error at best and a panic in the sign-in thread at worst, with
+/// nothing saying which request or what status. The status and the start of
+/// the body are what tell a rate limit (429) from a blocked identity (503).
+fn apple_plist(
+    step: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<Dictionary, AnisetteError> {
+    let refused = |why: String| {
+        let snippet: String = body.trim_start().chars().take(160).collect();
+        AnisetteError::ProvisioningFailed(format!(
+            "Apple refused {step} (HTTP {status}): {why}; body starts: {snippet:?}"
+        ))
+    };
+
+    if !status.is_success() {
+        return Err(refused("not a success status".to_string()));
+    }
+
+    plist::Value::from_reader(Cursor::new(body))
+        .map_err(|e| refused(format!("not a plist ({e})")))?
+        .into_dictionary()
+        .ok_or_else(|| refused("plist is not a dictionary".to_string()))
+}
+
+/// `dict[key]` as a string, or an error naming the missing key.
+fn plist_str<'d>(
+    step: &str,
+    dict: &'d Dictionary,
+    key: &str,
+) -> Result<&'d str, AnisetteError> {
+    dict.get(key).and_then(|v| v.as_string()).ok_or_else(|| {
+        AnisetteError::ProvisioningFailed(format!("Apple's {step} reply has no `{key}`"))
+    })
+}
+
+/// `dict[key]` as a dictionary, or an error naming the missing key.
+fn plist_dict<'d>(
+    step: &str,
+    dict: &'d Dictionary,
+    key: &str,
+) -> Result<&'d Dictionary, AnisetteError> {
+    dict.get(key)
+        .and_then(|v| v.as_dictionary())
+        .ok_or_else(|| {
+            AnisetteError::ProvisioningFailed(format!("Apple's {step} reply has no `{key}`"))
+        })
 }
 
 impl AnisetteClient {
     pub async fn new(url: String) -> Result<AnisetteClient, AnisetteError> {
         let path = format!("{}/v3/client_info", url);
-        let http_client = make_reqwest()?;
-        let client_info = http_client
+        let http = make_reqwest()?;
+        let mut client_info = http
             .get(path)
             .send()
             .await?
             .json::<AnisetteClientInfo>()
             .await?;
-        Ok(AnisetteClient { client_info, url })
+
+        let accepted = accepted_client_info(&client_info.client_info);
+        if accepted != client_info.client_info {
+            log::info!(
+                "anisette server advertises client info {:?}; sending {:?} instead",
+                client_info.client_info,
+                accepted
+            );
+            client_info.client_info = accepted;
+        }
+
+        Ok(AnisetteClient {
+            client_info,
+            url,
+            http,
+        })
     }
 
     fn build_apple_request(
@@ -216,7 +333,6 @@ impl AnisetteClient {
 
     pub async fn get_headers(&self, state: &AnisetteState) -> Result<AnisetteData, AnisetteError> {
         let path = format!("{}/v3/get_headers", self.url);
-        let http_client = make_reqwest()?;
 
         #[derive(Serialize)]
         struct GetHeadersBody {
@@ -249,7 +365,8 @@ impl AnisetteClient {
             },
         }
 
-        let headers = http_client
+        let headers = self
+            .http
             .post(path)
             .json(&body)
             .send()
@@ -261,7 +378,9 @@ impl AnisetteClient {
                 if message.contains("-45061") {
                     Err(AnisetteError::AnisetteNotProvisioned)
                 } else {
-                    panic!("Unknown error {}", message)
+                    Err(AnisetteError::ProvisioningFailed(format!(
+                        "anisette server could not produce headers: {message}"
+                    )))
                 }
             }
             AnisetteHeaders::Headers {
@@ -281,35 +400,24 @@ impl AnisetteClient {
 
     pub async fn provision(&self, state: &mut AnisetteState) -> Result<(), AnisetteError> {
         debug!("Provisioning Anisette");
-        let http_client = make_reqwest()?;
+        let started = Instant::now();
         let resp = self
             .build_apple_request(
                 &state,
-                http_client.get("https://gsa.apple.com/grandslam/GsService2/lookup"),
+                self.http
+                    .get("https://gsa.apple.com/grandslam/GsService2/lookup"),
             )
             .send()
             .await?;
+        log::info!("[anisette] lookup answered in {:?}", started.elapsed());
+        let status = resp.status();
         let text = resp.text().await?;
 
-        let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-        let urls = protocol_val
-            .as_dictionary()
-            .unwrap()
-            .get("urls")
-            .unwrap()
-            .as_dictionary()
-            .unwrap();
+        let protocol_val = apple_plist("lookup", status, &text)?;
+        let urls = plist_dict("lookup", &protocol_val, "urls")?;
 
-        let start_provisioning_url = urls
-            .get("midStartProvisioning")
-            .unwrap()
-            .as_string()
-            .unwrap();
-        let end_provisioning_url = urls
-            .get("midFinishProvisioning")
-            .unwrap()
-            .as_string()
-            .unwrap();
+        let start_provisioning_url = plist_str("lookup", urls, "midStartProvisioning")?;
+        let end_provisioning_url = plist_str("lookup", urls, "midFinishProvisioning")?;
         debug!(
             "Got provisioning urls: {} and {}",
             start_provisioning_url, end_provisioning_url
@@ -332,15 +440,50 @@ impl AnisetteClient {
                 #[allow(dead_code)] // it's not even dead, rust just has problems
                 adi_pb: String,
             },
+            // The server gave up waiting on its side of the exchange. It is by
+            // far the most common way provisioning a fresh identity fails: the
+            // server is shared and public, and every step in the middle is a
+            // round trip to Apple. Nothing is wrong with the account or the
+            // identity, so the caller should simply try again.
+            Timeout,
+            // The server reports a failed provisioning too. Without this the
+            // refusal fails to deserialize and surfaces as "unknown variant",
+            // which reads like a client bug and hides what actually went wrong.
+            EndProvisioningError {
+                #[serde(default, alias = "error", alias = "reason", alias = "detail")]
+                message: Option<String>,
+            },
+            // Anything else the server grows later: report it rather than
+            // failing to parse.
+            #[serde(other)]
+            Unknown,
         }
 
         loop {
-            let Some(Ok(data)) = connection.next().await else {
-                continue;
+            // Every way the socket can end has to end the loop. `next()` on a
+            // finished stream returns `None` immediately and forever, so the
+            // old `else { continue }` turned a closed connection into a spin
+            // that never came back -- one of the ways creating an identity
+            // appeared to hang rather than fail.
+            let data = match connection.next().await {
+                Some(Ok(data)) => data,
+                Some(Err(e)) => {
+                    return Err(AnisetteError::ProvisioningFailed(format!(
+                        "the provisioning connection failed: {e}"
+                    )));
+                }
+                None => {
+                    return Err(AnisetteError::ProvisioningTimeout);
+                }
             };
+
             if data.is_text() {
                 let txt = data.to_text().unwrap();
-                let msg: ProvisionInput = serde_json::from_str(txt)?;
+                let msg: ProvisionInput = serde_json::from_str(txt).map_err(|e| {
+                    AnisetteError::ProvisioningFailed(format!(
+                        "could not read the provisioning server's reply ({e}): {txt}"
+                    ))
+                })?;
                 match msg {
                     ProvisionInput::GiveIdentifier => {
                         #[derive(Serialize)]
@@ -355,31 +498,28 @@ impl AnisetteClient {
                             .await?;
                     }
                     ProvisionInput::GiveStartProvisioningData => {
-                        let http_client = make_reqwest()?;
+                        let started = Instant::now();
                         let body_data = ProvisionBodyData {
                             header: Dictionary::new(),
                             request: Dictionary::new(),
                         };
                         let resp = self
-                            .build_apple_request(state, http_client.post(start_provisioning_url))
+                            .build_apple_request(state, self.http.post(start_provisioning_url))
                             .body(plist_to_string(&body_data)?)
                             .send()
                             .await?;
+                        let status = resp.status();
                         let text = resp.text().await?;
 
-                        let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-                        let spim = protocol_val
-                            .as_dictionary()
-                            .unwrap()
-                            .get("Response")
-                            .unwrap()
-                            .as_dictionary()
-                            .unwrap()
-                            .get("spim")
-                            .unwrap()
-                            .as_string()
-                            .unwrap();
+                        let step = "midStartProvisioning";
+                        let protocol_val = apple_plist(step, status, &text)?;
+                        let response = plist_dict(step, &protocol_val, "Response")?;
+                        let spim = plist_str(step, response, "spim")?;
 
+                        log::info!(
+                            "[anisette] midStartProvisioning answered in {:?}",
+                            started.elapsed()
+                        );
                         debug!("GiveStartProvisioningData");
                         #[derive(Serialize)]
                         struct Spim {
@@ -393,27 +533,27 @@ impl AnisetteClient {
                             .await?;
                     }
                     ProvisionInput::GiveEndProvisioningData { cpim } => {
-                        let http_client = make_reqwest()?;
+                        let started = Instant::now();
                         let body_data = ProvisionBodyData {
                             header: Dictionary::new(),
                             request: Dictionary::from_iter([("cpim", cpim)].into_iter()),
                         };
                         let resp = self
-                            .build_apple_request(state, http_client.post(end_provisioning_url))
+                            .build_apple_request(state, self.http.post(end_provisioning_url))
                             .body(plist_to_string(&body_data)?)
                             .send()
                             .await?;
+                        let status = resp.status();
                         let text = resp.text().await?;
 
-                        let protocol_val = plist::Value::from_reader(Cursor::new(text.as_str()))?;
-                        let response = protocol_val
-                            .as_dictionary()
-                            .unwrap()
-                            .get("Response")
-                            .unwrap()
-                            .as_dictionary()
-                            .unwrap();
+                        let step = "midFinishProvisioning";
+                        let protocol_val = apple_plist(step, status, &text)?;
+                        let response = plist_dict(step, &protocol_val, "Response")?;
 
+                        log::info!(
+                            "[anisette] midFinishProvisioning answered in {:?}",
+                            started.elapsed()
+                        );
                         debug!("GiveEndProvisioningData");
 
                         #[derive(Serialize)]
@@ -422,8 +562,8 @@ impl AnisetteClient {
                             tk: &'t str,
                         }
                         let end_provisioning = EndProvisioning {
-                            ptm: response.get("ptm").unwrap().as_string().unwrap(),
-                            tk: response.get("tk").unwrap().as_string().unwrap(),
+                            ptm: plist_str(step, response, "ptm")?,
+                            tk: plist_str(step, response, "tk")?,
                         };
                         connection
                             .send(Message::Text(
@@ -437,11 +577,38 @@ impl AnisetteClient {
                         connection.close(None).await?;
                         break;
                     }
+                    ProvisionInput::Timeout => {
+                        let _ = connection.close(None).await;
+                        return Err(AnisetteError::ProvisioningTimeout);
+                    }
+                    ProvisionInput::EndProvisioningError { message } => {
+                        let _ = connection.close(None).await;
+                        return Err(AnisetteError::ProvisioningFailed(
+                            message.unwrap_or_else(|| {
+                                "the anisette server refused to finish provisioning".to_string()
+                            }),
+                        ));
+                    }
+                    ProvisionInput::Unknown => {
+                        let _ = connection.close(None).await;
+                        return Err(AnisetteError::ProvisioningFailed(format!(
+                            "unexpected reply from the provisioning server: {txt}"
+                        )));
+                    }
                 }
             } else if data.is_close() {
                 break;
             }
         }
+
+        // Reached either by the success arm or by the server hanging up. Only
+        // the first leaves an identity behind, and saying so here keeps a
+        // half-finished state.plist from being written and then puzzled over.
+        if !state.is_provisioned() {
+            return Err(AnisetteError::ProvisioningTimeout);
+        }
+
+        log::info!("[anisette] identity provisioned in {:?}", started.elapsed());
 
         Ok(())
     }
@@ -507,11 +674,42 @@ impl AnisetteHeadersProvider for RemoteAnisetteProviderV3 {
                     plist::to_file_xml(config_path, state)?;
                     client.get_headers(&state).await?
                 } else {
-                    panic!()
+                    // Used to panic here, which took the sign-in thread down
+                    // with no message at all.
+                    return Err(err);
                 }
             }
         };
         Ok(data.get_headers(self.serial.clone()))
+    }
+}
+
+#[cfg(test)]
+mod client_info_tests {
+    use super::accepted_client_info;
+
+    #[test]
+    fn xcode_identity_from_the_server_is_replaced() {
+        let advertised =
+            "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.dt.Xcode/3594.4.19)>";
+        let sent = accepted_client_info(advertised);
+        assert_eq!(
+            sent,
+            "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        );
+        assert!(!sent.contains("com.apple.dt.Xcode"));
+    }
+
+    #[test]
+    fn an_already_accepted_identity_is_unchanged() {
+        let ok = "<Mac17,3> <macOS;27.0;26A428> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+        assert_eq!(accepted_client_info(ok), ok);
+    }
+
+    #[test]
+    fn an_odd_shape_is_passed_through() {
+        assert_eq!(accepted_client_info("<OnlyOne>"), "<OnlyOne>");
+        assert_eq!(accepted_client_info(""), "");
     }
 }
 

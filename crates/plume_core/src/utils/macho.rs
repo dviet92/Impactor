@@ -24,7 +24,7 @@ pub struct MachO {
 
 impl MachO {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        let macho_data = fs::read(&path)?;
+        let macho_data = fs::read(&path).map_err(Error::io_at(&path))?;
         // Leak the data for 'static lifetime required by MachFile.
         let macho_data = Box::leak(macho_data.into_boxed_slice());
         let macho_file = MachFile::parse(macho_data)?; // macho_file.data is the full file data
@@ -67,7 +67,7 @@ impl MachO {
             let _ = builder.add_binary(binary.data);
         }
 
-        let writer = &mut fs::File::create(self.path.clone()).map_err(Error::from)?;
+        let writer = &mut fs::File::create(&self.path).map_err(Error::io_at(&self.path))?;
         builder.write(writer)?;
 
         Ok(())

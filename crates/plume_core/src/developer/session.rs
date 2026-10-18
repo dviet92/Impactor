@@ -40,7 +40,10 @@ impl DeveloperSession {
 
         Ok(DeveloperSession {
             anisette: account.anisette.clone(),
-            client: account.client.clone(),
+            // Not the account's client: that one is built for sign-in, which
+            // means through the proxy and with no connection reuse. Everything
+            // from here on is the developer API, which wants neither.
+            client: crate::developer_client()?,
             adsid: adsid.into(),
             xcode_gs_token,
         })
@@ -60,7 +63,7 @@ impl DeveloperSession {
         xcode_gs_token: String,
         anisette: Arc<Mutex<AnisetteData>>,
     ) -> Result<Self, Error> {
-        let client = crate::client()?;
+        let client = crate::developer_client()?;
 
         let s = Self {
             anisette,
